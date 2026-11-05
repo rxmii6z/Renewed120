@@ -13,6 +13,10 @@ It decouples the game logic from rendering to reach a smooth high frame rate:
 Needs [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader) and works alongside SilentPatch and DXVK (d3d9).
 The offsets are for the 1.0 US exe only.
 
+## Video
+
+Short video presenting the project: https://www.youtube.com/watch?v=uPssjMR5gXg
+
 ## Build
 
 ```
