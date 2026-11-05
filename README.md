@@ -23,3 +23,7 @@ cmake --build build --config Release
 Copy `build/Release/Renewed120.asi` and `Renewed120.ini` next to `gta_sa.exe`.
 
 No game files are included in this repository.
+
+## License
+
+GPL-3.0. You can reuse and modify this code, but derived work must stay open source under the same license. See [LICENSE](LICENSE).
