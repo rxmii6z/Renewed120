@@ -12,6 +12,8 @@ frame rate (as high as your monitor) without breaking the game.
 **Display**
 - uses the monitor's refresh rate instead of the fixed 60 Hz (`RefreshRateFix`, `ForceHz`)
 - borderless windowed fullscreen, no mode switch or black flash (`WindowMode`)
+- starts at the resolution of your desktop (`DesktopResolution`)
+- the game's own 30 fps frame limiter is turned off (`NoFrameLimiter`)
 - precise frame cap: automatic (monitor refresh rate), a fixed value or no cap (`FpsCap`)
 
 **Simulation / rendering split**

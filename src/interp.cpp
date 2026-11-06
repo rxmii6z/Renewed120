@@ -465,8 +465,8 @@ void UpdatePedHierarchies(bool tickFrame, float alpha) {
 }
 
 // ---- cutscenes ---------------------------------------------------------------------------------
-// Cutscene objects (CCutsceneObject, in the object pool) only exist during cutscenes: a few of them, found again
-// on each tick. Skinned ones (characters) get their skeleton blended, the others (props) their child frames.
+// Objects with a skeleton (cutscene characters) and cutscene objects without one (props: their animation moves
+// child frames of the clump): a few of them, found again on each tick.
 constexpr int MaxCs = 48;
 struct CsEntry { bool used; int slot; uintptr_t ent; bool skinned; HierSet h; BoneSet b; };   // all zero at start: kept out of the .asi file
 CsEntry g_cs[MaxCs];
@@ -483,12 +483,14 @@ void FindCutsceneObjects() {
         taken[c.slot] = true;
     }
     for (int i = 0; i < MaxObj; ++i) {
-        if (!g_obj[i].valid || taken[i] || !IsCutsceneObject(g_obj[i].ent)) continue;
+        if (!g_obj[i].valid || taken[i]) continue;
+        void* h = nullptr; uint8_t* m = nullptr; int n = 0;
+        const bool skinned = GetHier(g_obj[i].ent, h, m, n);
+        if (!skinned && !IsCutsceneObject(g_obj[i].ent)) continue;
         CsEntry* free = nullptr;
         for (auto& c : g_cs) if (!c.used) { free = &c; break; }
         if (!free) break;
-        void* h = nullptr; uint8_t* m = nullptr; int n = 0;
-        free->used = true; free->slot = i; free->ent = g_obj[i].ent; free->skinned = GetHier(free->ent, h, m, n);
+        free->used = true; free->slot = i; free->ent = g_obj[i].ent; free->skinned = skinned;
         free->h.valid = free->h.applied = false;
         free->b.n = 0; free->b.moved = free->b.applied = false;
     }
@@ -519,7 +521,7 @@ void FixAttachedProps() {
 }
 
 void UpdateCutscene(bool tickFrame, float alpha) {
-    if (!g_csSkeleton || !CutsceneRunning()) { ClearCutscene(); return; }
+    if (!g_csSkeleton) { ClearCutscene(); return; }
     if (tickFrame) FindCutsceneObjects();
     for (auto& c : g_cs) {
         if (!c.used) continue;

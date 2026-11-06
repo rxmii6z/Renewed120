@@ -701,7 +701,40 @@ void LimitFrame() {
     g_nextPresentQpc = next.QuadPart;   // when the next frame will be shown
 }
 
+// ---- startup video mode and frame limiter ------------------------------------------------------------------
+// psSelectDevice (0x746190) takes the video mode saved in gta_sa.set (CMenuManager::m_nPrefsVideoMode) if the list of
+// usable modes (0x745AF0) accepts it. Right after that list is built, the mode matching the desktop is put there.
+constexpr uintptr_t SITE_VideoModes = 0x74629C, EXPECT_VideoModes = 0x745AF0;
+constexpr uintptr_t ADDR_PrefsVideoMode = 0xBA6820;
+constexpr uintptr_t ADDR_RwEngineGetNumVideoModes = 0x7F2CC0, ADDR_RwEngineGetVideoModeInfo = 0x7F2CF0;
+constexpr uintptr_t ADDR_FrameLimiter = 0xBA6794;   // CMenuManager::m_bFrameLimiterOn (30 fps cap of the main loop)
+struct RwVideoMode { int width, height, depth, flags, refRate, format, pad[4]; };   // flags & 1 = exclusive (fullscreen)
+using VideoModesFn = const int*(__cdecl*)();
+VideoModesFn g_origVideoModes = nullptr;
+bool g_noFrameLimiter = true;
+
+const int* __cdecl HookedVideoModes() {
+    const int* usable = g_origVideoModes();
+    DEVMODEW dm{}; dm.dmSize = sizeof(dm);
+    if (!usable || !EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm)) return usable;
+    const int n = reinterpret_cast<int(__cdecl*)()>(ADDR_RwEngineGetNumVideoModes)();
+    int best = -1, bestDepth = 0;
+    for (int i = 1; i < n; ++i) {   // mode 0 is the windowed one
+        RwVideoMode m{};
+        reinterpret_cast<void*(__cdecl*)(RwVideoMode*, int)>(ADDR_RwEngineGetVideoModeInfo)(&m, i);
+        if (!usable[i] || !(m.flags & 1)) continue;
+        if (m.width == int(dm.dmPelsWidth) && m.height == int(dm.dmPelsHeight) && m.depth > bestDepth) { best = i; bestDepth = m.depth; }
+    }
+    if (best > 0) {
+        *reinterpret_cast<int*>(ADDR_PrefsVideoMode) = best;
+        Log("desktop resolution %lux%lu: video mode %d", dm.dmPelsWidth, dm.dmPelsHeight, best);
+    } else Log("desktop resolution %lux%lu: no matching video mode, keeping the saved one", dm.dmPelsWidth, dm.dmPelsHeight);
+    if (g_noFrameLimiter) *reinterpret_cast<uint8_t*>(ADDR_FrameLimiter) = 0;
+    return usable;
+}
+
 HRESULT WINAPI HookedPresent(void* dev, const RECT* src, const RECT* dst, HWND wnd, const void* dirty) {
+    if (g_noFrameLimiter) *reinterpret_cast<volatile uint8_t*>(ADDR_FrameLimiter) = 0;   // the menu or gta_sa.set may turn it on
     FlushGuard();
     ++g_presentCount;
     Telemetry::OnFrame();
@@ -755,7 +788,7 @@ void Init(HMODULE self) {
     g_telemetry = GetPrivateProfileIntW(L"Renewed120", L"Telemetry", 0, ini) != 0;
     g_fpsCapSetting = static_cast<int>(GetPrivateProfileIntW(L"Renewed120", L"FpsCap", 0, ini));
     ApplyFpsCap(nullptr);
-    g_logicHz = static_cast<int>(GetPrivateProfileIntW(L"Renewed120", L"LogicHz", 0, ini));
+    g_logicHz = static_cast<int>(GetPrivateProfileIntW(L"Renewed120", L"LogicHz", 30, ini));
     if (g_logicHz < 0 || g_logicHz > 60) g_logicHz = 0;
     if (!g_fixRefresh && !g_telemetry && g_fpsCapSetting < 0 && g_logicHz <= 0) { Log("all modules disabled"); return; }
     if (g_logicHz > 0) {
@@ -804,6 +837,10 @@ void Init(HMODULE self) {
         swprintf_s(csv, L"%s.telemetry.csv", path);
         Telemetry::Start(csv);
     }
+    g_noFrameLimiter = GetPrivateProfileIntW(L"Renewed120", L"NoFrameLimiter", 1, ini) != 0;
+    if (GetPrivateProfileIntW(L"Renewed120", L"DesktopResolution", 1, ini) != 0 &&
+        HookCall(SITE_VideoModes, reinterpret_cast<void*>(&HookedVideoModes), reinterpret_cast<void**>(&g_origVideoModes), EXPECT_VideoModes))
+        Log("desktop resolution at startup");
     g_forceHz = static_cast<int>(GetPrivateProfileIntW(L"Renewed120", L"ForceHz", 0, ini));
     g_windowMode = static_cast<int>(GetPrivateProfileIntW(L"Renewed120", L"WindowMode", 1, ini));
     Interp::SetVehicleParts(GetPrivateProfileIntW(L"Renewed120", L"VehicleParts", 1, ini) != 0);
