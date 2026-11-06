@@ -1,17 +1,51 @@
 # Renewed120
 
 ASI plugin for **GTA San Andreas 1.0 US** (work in progress, part of the GTA SA Renewed project).
-It decouples the game logic from rendering to reach a smooth high frame rate:
 
-- game simulation fixed at 30 Hz, rendering up to 180+ fps (`LogicHz`, `FpsCap`)
-- interpolation of camera, vehicles, peds (skeleton bones) and objects between simulation ticks
-- refresh rate fix (uses the monitor's refresh rate) and borderless windowed mode (`WindowMode`)
-- fixes for systems that assumed one render per simulation step: water, wheel rotation, vehicle/ped state guard, blood pools
-- in-game developer menu (F9) to toggle every feature live
-- optional telemetry (`Telemetry=1`)
+GTA SA ties its whole simulation to the frame rate: above 30 fps physics, animations and many effects start to misbehave.
+Renewed120 separates the two. The world is simulated at a fixed rate (30 Hz by default) exactly like the original
+game, and every frame drawn in between shows a smooth blend of the last two simulated states. The result is a high
+frame rate (as high as your monitor) without breaking the game.
 
-Needs [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader) and works alongside SilentPatch and DXVK (d3d9).
-The offsets are for the 1.0 US exe only.
+## Features
+
+**Display**
+- uses the monitor's refresh rate instead of the fixed 60 Hz (`RefreshRateFix`, `ForceHz`)
+- borderless windowed fullscreen, no mode switch or black flash (`WindowMode`)
+- precise frame cap: automatic (monitor refresh rate), a fixed value or no cap (`FpsCap`)
+
+**Simulation / rendering split**
+- game logic at a fixed rate (`LogicHz`, 30 by default), each step simulating exactly the same time (`FixedStep`)
+- interpolation between two simulation steps (`Interpolate`) of:
+  - the camera, in game and in cutscenes (camera cuts are detected and not blended)
+  - vehicles and their parts: wheels, doors, suspension, bike handlebars and forks (`VehicleParts`)
+  - peds and their skeleton animations, with smooth real-time shadows (`PedSkeleton`)
+  - objects and cutscene characters with the props they hold (`CutsceneSkeleton`)
+
+**Fixes for the game systems that expected one drawn frame per simulation step**
+- water drawn and animated on every frame, no blinking sea (`WaterFix`)
+- vehicle and ped physics untouched by the extra drawn frames: no rear axle wobble, no icy sand (`VehicleGuard`)
+- blood pools and other fixed shadows kept between steps (`StaticShadowFix`)
+- particles (smoke, sparks...) and broken object pieces animated on every frame (`SmoothFx`)
+- headlight patches of AI cars on the ground recomputed every frame (`SmoothCarLights`)
+- map models and LODs loaded from disk as fast as in the original game (`StreamEveryFrame`)
+
+**Developer tools**
+- in-game developer menu on **F9**: toggle every feature live and save the settings to the ini (`DevMenu`)
+- log file (`Log`) and optional telemetry CSV with FPS, frame times and the time spent in the mod (`Telemetry`)
+
+Every option is explained in [Renewed120.ini](Renewed120.ini).
+
+## Requirements
+
+- GTA San Andreas **1.0 US** exe (the memory addresses are for that version only)
+- [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader)
+- works alongside SilentPatch and DXVK (d3d9)
+
+## Install
+
+Download the zip from the [releases](https://github.com/rxmii6z/Renewed120/releases) and extract `Renewed120.asi` and
+`Renewed120.ini` next to `gta_sa.exe`.
 
 ## Video
 
@@ -24,7 +58,7 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A Win32
 cmake --build build --config Release
 ```
 
-Copy `build/Release/Renewed120.asi` and `Renewed120.ini` next to `gta_sa.exe`.
+The plugin is written to `build/Release/Renewed120.asi`.
 
 No game files are included in this repository.
 

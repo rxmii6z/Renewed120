@@ -1,13 +1,14 @@
-// Renewed120 - RefreshRateFix module.
+// Renewed120 - high frame rate for GTA San Andreas 1.0 US.
 //
-// GTA SA asks Direct3D9 for a fullscreen mode at a fixed 60 Hz. This module hooks
-// IDirect3D9::CreateDevice and IDirect3DDevice9::Reset (through their shared vtables, so
-// it also works with a DXVK d3d9.dll) and replaces the requested refresh rate with the
-// desktop one, after checking the mode really exists.
+// - Direct3D9 (works with a DXVK d3d9.dll too): the monitor's refresh rate instead of the fixed 60 Hz, borderless
+//   windowed fullscreen, precise frame cap.
+// - Logic/render split: the game is simulated LogicHz times per second, the frames drawn in between show a blend
+//   of the last two simulated states (interp.cpp), with fixes for the game systems that assumed one drawn frame
+//   per simulated one (water, shadows, particles, physics state touched while drawing...).
+// - Developer menu (F9) and optional telemetry.
 //
 // Minimal D3D9 declarations are repeated here on purpose: no DirectX SDK is needed.
 #include <windows.h>
-#include <intrin.h>
 #include <cstring>
 #include <cstdio>
 #include <cstdarg>
@@ -60,11 +61,11 @@ ResetFn        g_origReset = nullptr;
 PresentFn      g_origPresent = nullptr;
 bool           g_fixRefresh = true;
 bool           g_telemetry = false;
-int            g_fpsCap = 0;
+int            g_fpsCap = 0;      // effective render cap (0 = none)
+int            g_fpsCapSetting = 0;   // ini/menu value: -1 = off, 0 = auto (monitor refresh rate), > 0 = fixed
 void*          g_d3d = nullptr;       // our own IDirect3D9, used only to query modes
 int            g_forceHz = 0;
 int            g_windowMode = 1;   // 0 = exclusive fullscreen, 1 = borderless windowed fullscreen
-HWND           g_gameWnd = nullptr;
 int            g_backW = 1920, g_backH = 1080;
 unsigned       g_presentCount = 0;
 bool           g_log = true;
@@ -77,6 +78,22 @@ void Log(const char* fmt, ...) {
     if (_wfopen_s(&f, g_logPath, L"a") != 0 || !f) return;
     va_list a; va_start(a, fmt); vfprintf(f, fmt, a); va_end(a);
     fputc('\n', f); fclose(f);
+}
+
+// Current refresh rate of the monitor showing the game window (primary monitor if none yet).
+int MonitorHz(HWND wnd) {
+    MONITORINFOEXW mi{}; mi.cbSize = sizeof(mi);
+    HMONITOR mon = MonitorFromWindow(wnd, MONITOR_DEFAULTTOPRIMARY);
+    DEVMODEW dev{}; dev.dmSize = sizeof(dev);
+    const wchar_t* name = (mon && GetMonitorInfoW(mon, &mi)) ? mi.szDevice : nullptr;
+    if (!EnumDisplaySettingsW(name, ENUM_CURRENT_SETTINGS, &dev) || dev.dmDisplayFrequency <= 1) return 60;   // 0/1 = "hardware default"
+    return int(dev.dmDisplayFrequency);
+}
+HWND g_gameWnd = nullptr;
+void ApplyFpsCap(HWND wnd) {
+    const int before = g_fpsCap;
+    g_fpsCap = g_fpsCapSetting > 0 ? g_fpsCapSetting : (g_fpsCapSetting == 0 ? MonitorHz(wnd) : 0);
+    if (g_fpsCap != before) Log("render cap: %d fps (setting %d)", g_fpsCap, g_fpsCapSetting);
 }
 
 void** VTable(void* obj) { return *reinterpret_cast<void***>(obj); }
@@ -164,6 +181,7 @@ void ApplyBorderless(HWND wnd, const PresentParams* pp) {
     g_bx = x; g_by = y; g_bw = w; g_bh = h; g_bwnd = wnd;
     SetForegroundWindow(wnd); SetActiveWindow(wnd); SetFocus(wnd);   // a windowed GTA pauses itself when it is not the active window
     Log("borderless window %dx%d at %d,%d (monitor %dx%d)", w, h, x, y, mw, mh);
+    ApplyFpsCap(wnd);
 }
 
 HRESULT WINAPI HookedReset(void* dev, PresentParams* pp) {
@@ -199,11 +217,18 @@ int    g_logicHz = 0;
 bool   g_interpolate = false;
 bool   g_renderOnly = false;
 LONGLONG g_lastTickQpc = 0, g_tickPeriodQpc = 1;
-unsigned g_ticks = 0, g_renderOnlyFrames = 0;
+unsigned g_ticks = 0;
 
-float TickAlpha() {
+// The moment the frame being built will be shown. With the frame cap, Present is held until a fixed schedule
+// (see LimitFrame), so the scheduled time is known in advance: blending for it instead of "now" removes the
+// uneven steps of tick frames (they start later because the simulation runs first, but are shown on schedule).
+LONGLONG g_nextPresentQpc = 0;
+LONGLONG FrameQpc() {
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    const double a = double(now.QuadPart - g_lastTickQpc) / double(g_tickPeriodQpc);
+    return (g_fpsCap > 0 && g_nextPresentQpc > now.QuadPart - g_tickPeriodQpc) ? g_nextPresentQpc : now.QuadPart;
+}
+float TickAlpha() {
+    const double a = double(FrameQpc() - g_lastTickQpc) / double(g_tickPeriodQpc);
     return a < 0.0 ? 0.0f : (a > 1.0 ? 1.0f : float(a));
 }
 
@@ -222,7 +247,6 @@ bool HookCall(uintptr_t site, void* hook, void** origOut, uintptr_t expected) {
     return true;
 }
 
-
 // ---- water: CWaterLevel scrolls with ms_fTimeStep on every call and runs a periodic update on frame counter
 // 0x1d (mod 32). Both assume one call per simulated frame, so on render-only frames spread them out.
 constexpr uintptr_t SITE_WaterFn   = 0x6EB710;   // first instruction is "call 0x53C4B0"
@@ -233,10 +257,11 @@ using BoolFn = char(__cdecl*)();
 BoolFn g_origWaterGate = nullptr;
 bool g_waterRedo = true;
 bool g_freezeVeh = true;   // vehicle physics guard around PreRender
+bool g_fixedStep = true;   // simulate exactly one schedule period per tick
 bool     g_waterSaved = false;
 float    g_savedStep = 0;
 uint32_t g_savedCtr = 0;
-unsigned g_waterCalls = 0, g_waterLastTick = ~0u;
+unsigned g_waterLastTick = ~0u;
 LONGLONG g_waterLastQpc = 0;
 
 void RestoreWaterTiming() {
@@ -266,6 +291,35 @@ char __cdecl HookedWaterGate() {
     return g_origWaterGate();
 }
 
+// ---- car headlight patches on the ground ------------------------------------------------------------------
+// CShadows::StoreCarLightShadow picks the headlight patch of AI cars from "speed x ms_fTimeStep" (fmul at 0x70C679).
+// The time step is scaled down on render-only frames (water, PreRender guard), so the choice flipped every tick and
+// the patch jerked. That instruction reads this copy of the tick's step instead.
+float g_tickStep = 50.0f / 30.0f;
+bool PatchCarLightStep() {
+    auto* p = reinterpret_cast<uint8_t*>(0x70C679);
+    const uint8_t expect[6] = {0xD8, 0x0D, 0x5C, 0xCB, 0xB7, 0x00};   // fmul dword ptr [0xB7CB5C]
+    if (std::memcmp(p, expect, 6) != 0) { Log("car light step patch: unexpected code, skipped"); return false; }
+    DWORD old;
+    if (!VirtualProtect(p, 6, PAGE_EXECUTE_READWRITE, &old)) return false;
+    *reinterpret_cast<float**>(p + 2) = &g_tickStep;
+    VirtualProtect(p, 6, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, 6);
+    return true;
+}
+// Slow AI cars get their headlight patch as a cached static shadow (CShadows::StoreStaticShadow at 0x70C6E6), only
+// recomputed after the car moved a few cm: it crawled in jumps. The player's car always takes the per-frame path
+// (0x70C6F4); make every car take it ("je" at 0x70C68A -> "jmp").
+bool PatchCarLightAlwaysMoving() {
+    auto* p = reinterpret_cast<uint8_t*>(0x70C68A);
+    if (p[0] != 0x74 || p[1] != 0x68) { Log("car light path patch: unexpected code, skipped"); return false; }
+    DWORD old;
+    if (!VirtualProtect(p, 1, PAGE_EXECUTE_READWRITE, &old)) return false;
+    p[0] = 0xEB;
+    VirtualProtect(p, 1, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, 2);
+    return true;
+}
 
 // ---- developer menu (F9) ---------------------------------------------------------------------------------
 // Drawn with the game's own CFont after Render2dStuff. Keys: F9 open/close, PgUp/PgDn select, Home/End change,
@@ -276,8 +330,9 @@ bool   g_menuOpen = false;
 int    g_menuSel = 0;
 wchar_t g_iniPath[MAX_PATH];
 
-extern bool g_probe;
-constexpr int MenuItems = 9;
+extern bool g_splitFx;
+extern bool g_streamEveryFrame;
+extern bool g_staticFix;
 
 using FontF2 = void(__cdecl*)(float, float);
 using FontB1 = void(__cdecl*)(uint8_t);
@@ -286,7 +341,7 @@ using FontU4 = void(__cdecl*)(uint32_t);
 using FontF1 = void(__cdecl*)(float);
 using FontPrint = void(__cdecl*)(float, float, const char*);
 
-constexpr int FpsCaps[] = {0, 60, 90, 120, 144, 165, 180, 240};
+constexpr int FpsCaps[] = {0, -1, 60, 90, 120, 144, 165, 180, 240};   // 0 = auto, -1 = off
 constexpr int LogicRates[] = {15, 20, 25, 30, 45, 60};
 template <size_t N> int CycleIndex(const int (&a)[N], int v, int dir) {
     int i = 0;
@@ -305,20 +360,26 @@ bool KeyPressed(int vk) {   // edge-triggered
 void SaveIni() {
     auto put = [](const wchar_t* k, int v) { wchar_t b[16]; swprintf_s(b, L"%d", v); WritePrivateProfileStringW(L"Renewed120", k, b, g_iniPath); };
     put(L"Interpolate", g_interpolate); put(L"VehicleParts", Interp::VehicleParts()); put(L"PedSkeleton", Interp::PedSkeleton());
-    put(L"WaterFix", g_waterRedo); put(L"VehicleGuard", g_freezeVeh); put(L"FpsCap", g_fpsCap); put(L"LogicHz", g_logicHz);
+    put(L"CutsceneSkeleton", Interp::CutsceneSkeleton()); put(L"WaterFix", g_waterRedo); put(L"StaticShadowFix", g_staticFix);
+    put(L"SmoothFx", g_splitFx); put(L"StreamEveryFrame", g_streamEveryFrame); put(L"VehicleGuard", g_freezeVeh);
+    put(L"FpsCap", g_fpsCapSetting); put(L"LogicHz", g_logicHz);
 }
 
+constexpr int MenuItems = 12;
 void MenuChange(int dir) {   // dir: -1 / +1 (Enter = +1)
     switch (g_menuSel) {
     case 0: if (g_interpolate) Interp::Restore(); g_interpolate = !g_interpolate; break;
     case 1: Interp::Restore(); Interp::SetVehicleParts(!Interp::VehicleParts()); break;
     case 2: Interp::Restore(); Interp::SetPedSkeleton(!Interp::PedSkeleton()); break;
-    case 3: g_waterRedo = !g_waterRedo; break;
-    case 4: g_fpsCap = FpsCaps[CycleIndex(FpsCaps, g_fpsCap, dir)]; break;
-    case 5: g_logicHz = LogicRates[CycleIndex(LogicRates, g_logicHz, dir)]; break;
-    case 6: g_freezeVeh = !g_freezeVeh; break;
-    case 7: SaveIni(); break;
-    case 8: g_probe = !g_probe; break;
+    case 3: Interp::Restore(); Interp::SetCutsceneSkeleton(!Interp::CutsceneSkeleton()); break;
+    case 4: g_waterRedo = !g_waterRedo; break;
+    case 5: g_staticFix = !g_staticFix; break;
+    case 6: g_splitFx = !g_splitFx; break;
+    case 7: g_streamEveryFrame = !g_streamEveryFrame; break;
+    case 8: g_freezeVeh = !g_freezeVeh; break;
+    case 9: g_fpsCapSetting = FpsCaps[CycleIndex(FpsCaps, g_fpsCapSetting, dir)]; ApplyFpsCap(g_gameWnd); break;
+    case 10: g_logicHz = LogicRates[CycleIndex(LogicRates, g_logicHz, dir)]; break;
+    case 11: SaveIni(); break;
     }
 }
 
@@ -370,16 +431,22 @@ void DrawMenu() {
     char val[48];
     for (int i = 0; i < MenuItems; ++i) {
         const char* name = ""; val[0] = 0;
+        auto onOff = [&](bool v) { strcpy_s(val, v ? "ON" : "OFF"); };
         switch (i) {
-        case 0: name = "Interpolation"; strcpy_s(val, g_interpolate ? "ON" : "OFF"); break;
-        case 1: name = "Vehicle parts (wheels/doors)"; strcpy_s(val, Interp::VehicleParts() ? "ON" : "OFF"); break;
-        case 2: name = "Ped skeleton"; strcpy_s(val, Interp::PedSkeleton() ? "ON" : "OFF"); break;
-        case 3: name = "Water fix"; strcpy_s(val, g_waterRedo ? "ON" : "OFF"); break;
-        case 4: name = "FPS cap"; if (g_fpsCap > 0) sprintf_s(val, "%d", g_fpsCap); else strcpy_s(val, "off"); break;
-        case 5: name = "Logic rate (Hz)"; sprintf_s(val, "%d", g_logicHz); break;
-        case 6: name = "Physics guard (veh+peds)"; strcpy_s(val, g_freezeVeh ? "ON" : "OFF"); break;
-        case 7: name = "Save to ini"; strcpy_s(val, "[Enter]"); break;
-        case 8: name = "Draw probe (writes log)"; strcpy_s(val, g_probe ? "ON" : "OFF"); break;
+        case 0: name = "Interpolation"; onOff(g_interpolate); break;
+        case 1: name = "Vehicle parts (wheels/doors)"; onOff(Interp::VehicleParts()); break;
+        case 2: name = "Ped skeleton"; onOff(Interp::PedSkeleton()); break;
+        case 3: name = "Cutscene skeletons"; onOff(Interp::CutsceneSkeleton()); break;
+        case 4: name = "Water fix"; onOff(g_waterRedo); break;
+        case 5: name = "Static shadow fix (blood)"; onOff(g_staticFix); break;
+        case 6: name = "Smooth particles/debris"; onOff(g_splitFx); break;
+        case 7: name = "Load models every frame"; onOff(g_streamEveryFrame); break;
+        case 8: name = "Physics guard (veh+peds)"; onOff(g_freezeVeh); break;
+        case 9: name = "FPS cap";
+            if (g_fpsCapSetting == 0) sprintf_s(val, "auto (%d)", g_fpsCap); else if (g_fpsCap > 0) sprintf_s(val, "%d", g_fpsCap); else strcpy_s(val, "off");
+            break;
+        case 10: name = "Logic rate (Hz)"; sprintf_s(val, "%d", g_logicHz); break;
+        case 11: name = "Save to ini"; strcpy_s(val, "[Enter]"); break;
         }
         snprintf(line, sizeof(line), "%s %s: %s", i == g_menuSel ? ">" : " ", name, val);
         print(line, i == g_menuSel ? YELLOW : WHITE);
@@ -398,7 +465,7 @@ void __cdecl HookedTimerUpdate() {
     if (g_logicHz <= 0) { g_origTimerUpdate(); return; }   // split disabled after a partial hook failure
     if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
     const uint8_t menu = *reinterpret_cast<volatile uint8_t*>(ADDR_MenuActive);
-    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    LARGE_INTEGER now; now.QuadPart = FrameQpc();   // the time this frame will be shown
     const LONGLONG period = freq.QuadPart / g_logicHz;
 
     // Menus/loading always run the full original path.
@@ -410,8 +477,9 @@ void __cdecl HookedTimerUpdate() {
     }
     if (tick) {
         // Keep a fixed schedule; resync after hitches instead of fast-forwarding.
-        nextTick.QuadPart = (nextTick.QuadPart == 0 || menu || now.QuadPart > nextTick.QuadPart + 2 * period)
-                                ? now.QuadPart + period : nextTick.QuadPart + period;
+        const LONGLONG sched = (nextTick.QuadPart == 0 || menu || now.QuadPart > nextTick.QuadPart + 2 * period)
+                                   ? now.QuadPart : nextTick.QuadPart;
+        nextTick.QuadPart = sched + period;
         g_renderOnly = false;
         ++g_ticks;
         const double t0 = Interp::NowUs();
@@ -419,21 +487,42 @@ void __cdecl HookedTimerUpdate() {
         FlushGuard();
         Interp::Restore();   // the simulation must see the real, latest state
         const double t1 = Interp::NowUs();
-        g_lastTickQpc = now.QuadPart;
+        g_lastTickQpc = sched;   // on the fixed schedule: blend steps stay even
         g_tickPeriodQpc = period;
         g_origTimerUpdate();
+        // CTimer measures the real time since the previous tick, which wobbles by a few ms around the schedule;
+        // the blend assumes exactly one period per tick, so a wobbling step made moving things speed up and slow
+        // down every tick. Simulate exactly one period (keeping the game's time scale; pauses keep their 0 step).
+        if (g_fixedStep && !menu) {
+            float& step = *reinterpret_cast<float*>(ADDR_TimeStepF);
+            const float scale = *reinterpret_cast<const float*>(0xB7CB64);   // CTimer::ms_fTimeScale
+            const float want = (50.0f / float(g_logicHz)) * scale;
+            // only correct a small wobble: anything else (loading hitch, unknown time scale) stays as the game made it
+            if (step > 0.0f && scale > 0.0f && step > want * 0.6f && step < want * 1.4f) step = want;
+        }
+        g_tickStep = *reinterpret_cast<const float*>(ADDR_TimeStepF);
         const double t2 = Interp::NowUs();
         Interp::g_timing.restoreUs += t1 - t0;
         Interp::g_timing.updateUs += t2 - t1;
         ++Interp::g_timing.ticks;
     } else {
         g_renderOnly = true;
-        ++g_renderOnlyFrames;
     }
 }
 
+// CStreaming::LoadRequestedModels: takes the finished disk reads and loads the models, one read per channel per call.
+// The game calls it from CStreaming::Update in CGame::Process, i.e. once per tick: at 30 ticks/s the map, LODs and
+// cars loaded several times slower than in the original game running at a high frame rate. It is called alone on
+// the frames without a tick (what the original game does on every frame; nothing else of Update runs).
+constexpr uintptr_t ADDR_LoadRequestedModels = 0x40E3A0, ADDR_GameState = 0xC8D4C0;   // gGameState: 9 = playing
+bool g_streamEveryFrame = true;
 void __cdecl HookedGameProcess() {
-    if (g_logicHz > 0 && g_renderOnly) return;
+    if (g_logicHz > 0 && g_renderOnly) {
+        // only in the running game (gGameState 9), never in the pause/main menu (FrontEndMenuManager.m_bMenuActive)
+        if (g_streamEveryFrame && *reinterpret_cast<const int*>(ADDR_GameState) == 9 && !*reinterpret_cast<const uint8_t*>(ADDR_MenuActive))
+            reinterpret_cast<VoidFn>(ADDR_LoadRequestedModels)();
+        return;
+    }
     const double t0 = Interp::NowUs();
     g_origGameProcess();
     const double t1 = Interp::NowUs();
@@ -455,6 +544,7 @@ void FlushGuard() {
 }
 
 void __cdecl HookedPreRender() {
+    if (g_interpolate) Interp::CapturePedFrames(!g_renderOnly);
     if (g_logicHz <= 0 || !g_freezeVeh) { g_origPreRender(); return; }
     float* ts = reinterpret_cast<float*>(ADDR_TimeStepF);
     const float before = *ts;
@@ -473,84 +563,94 @@ void __cdecl HookedPreRender() {
     *ts = before;
 }
 
-// Stored shadows (CShadows::asShadowsStored, 48 x 0x40 bytes at 0xC4A034) that the simulation registered during a tick are
-// consumed when drawn. Re-insert them on the render-only frames of that tick so they are drawn every frame.
-constexpr uintptr_t ADDR_StoredShadows = 0xC4A034;
-constexpr int StoredShadowCount = 48, StoredShadowSize = 0x40;
-uint8_t g_shadowSnap[StoredShadowCount * StoredShadowSize];
-bool g_shadowKeep = false;   // experimental (crashed inside d3d9): re-insert stored shadows on render-only frames
-void ShadowsAfterProcess(bool tickFrame) {
-    if (!g_shadowKeep) return;
-    __try {
-        auto* cur = reinterpret_cast<uint8_t*>(ADDR_StoredShadows);
-        if (tickFrame) {
-            std::memcpy(g_shadowSnap, cur, sizeof(g_shadowSnap));
-        } else {
-            for (int i = 0; i < StoredShadowCount; ++i) {
-                uint8_t* slot = cur + i * StoredShadowSize;
-                const uint8_t* snap = g_shadowSnap + i * StoredShadowSize;
-                if (*reinterpret_cast<const uint32_t*>(slot) == 0 && *reinterpret_cast<const uint32_t*>(snap) != 0)
-                    std::memcpy(slot, snap, StoredShadowSize);
-            }
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+// ---- static shadows (blood pools, permanent shadows...) --------------------------------------------------------
+// CShadows::UpdateStaticShadows (0x707F40) runs right before the shadows are drawn, every drawn frame, and frees each
+// static shadow that was not stored again since its previous call. The game re-stores them once per simulated tick
+// (UpdatePermanentShadows in CGame::Process, ped tasks), so on render-only frames they were deleted: blinking pools,
+// worse with more frames per tick. Only run it on tick frames.
+constexpr uintptr_t SITE_UpdStatic1 = 0x53DDD6, SITE_UpdStatic2 = 0x53E0BE, EXPECT_UpdStatic = 0x707F40;
+VoidFn g_origUpdStatic1 = nullptr, g_origUpdStatic2 = nullptr;
+bool g_staticFix = true;
+void __cdecl HookedUpdStatic1() { if (g_logicHz > 0 && g_renderOnly && g_staticFix) return; g_origUpdStatic1(); }
+void __cdecl HookedUpdStatic2() { if (g_logicHz > 0 && g_renderOnly && g_staticFix) return; g_origUpdStatic2(); }
+
+// ---- particles and broken-object pieces ---------------------------------------------------------------------
+// CGame::Process advances the effect system (Fx_c::Update, call at 0x53C1F0, dt in seconds) and the pieces of broken
+// objects (BreakManager_c::Update, call at 0x59E670 site 0x53C201, raw timestep) once per tick, so they moved at 30 fps.
+// Like the water: each call (tick frame in Process, render-only frames from ConstructList) advances them by the share
+// of the tick that elapsed since the previous call.
+constexpr uintptr_t SITE_FxUpdate = 0x53C1F0, EXPECT_FxUpdate = 0x49E640;
+constexpr uintptr_t SITE_BreakUpdate = 0x53C201, EXPECT_BreakUpdate = 0x59E670;
+using FxUpdateFn = void(__thiscall*)(void*, void*, float);
+using BreakUpdateFn = void(__thiscall*)(void*, float);
+FxUpdateFn g_origFx = nullptr;
+BreakUpdateFn g_origBreak = nullptr;
+bool g_splitFx = true;
+struct SplitState { void* self = nullptr; void* cam = nullptr; float step = 0; LONGLONG last = 0; bool have = false; };
+SplitState g_fx, g_break;
+float SplitFrac(SplitState& s) {
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    double f = s.last ? double(now.QuadPart - s.last) / double(g_tickPeriodQpc) : 1.0;
+    s.last = now.QuadPart;
+    return f < 0.0 ? 0.0f : (f > 1.0 ? 1.0f : float(f));
 }
-
-// ---- blood pools ---------------------------------------------------------------------------------------------
-// A dead ped's task registers the fresh blood pool as a stored shadow (CShadows::StoreShadowToBeRendered, 17 arguments, call
-// at 0x630E63) once per simulated tick; stored shadows are consumed when drawn, so the pool only showed on tick frames.
-// Remember the arguments (deep-copying the position vector) and replay the call on the render-only frames of the tick.
-constexpr uintptr_t SITE_BloodStore = 0x630E63, EXPECT_BloodStore = 0x70BA00;
-using StoreFn = void(__cdecl*)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
-                                uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
-StoreFn g_origBloodStore = nullptr;
-struct BloodCall { uint32_t a[17]; float pos[3]; };
-constexpr int MaxBlood = 16;
-BloodCall g_blood[MaxBlood];
-int  g_bloodN = 0;
-bool g_bloodReplay = true;
-unsigned g_bloodTick = ~0u;
-
-void __cdecl HookedBloodStore(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t a4, uint32_t a5, uint32_t a6, uint32_t a7,
-                              uint32_t a8, uint32_t a9, uint32_t a10, uint32_t a11, uint32_t a12, uint32_t a13, uint32_t a14,
-                              uint32_t a15, uint32_t a16) {
-    if (g_logicHz > 0 && g_bloodReplay) {
-        if (g_renderOnly) {
-            // it runs on render frames by itself: nothing to replay
-            g_bloodReplay = false;
-            Log("blood pool store runs every frame, replay disabled");
-        } else {
-            if (g_bloodTick != g_ticks) { g_bloodTick = g_ticks; g_bloodN = 0; }
-            if (g_bloodN < MaxBlood) {
-                BloodCall& b = g_blood[g_bloodN];
-                const uint32_t v[17] = {a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16};
-                std::memcpy(b.a, v, sizeof(v));
-                bool ok = true;
-                __try { std::memcpy(b.pos, reinterpret_cast<const void*>(a3), sizeof(b.pos)); } __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
-                if (ok) ++g_bloodN;
-            }
-        }
-    }
-    g_origBloodStore(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16);
+void __fastcall HookedFx(void* self, void*, void* cam, float dt) {
+    if (g_logicHz <= 0 || !g_splitFx) { g_fx.have = false; g_origFx(self, cam, dt); return; }
+    g_fx.self = self; g_fx.cam = cam; g_fx.step = dt; g_fx.have = true;
+    g_origFx(self, cam, dt * SplitFrac(g_fx));
 }
-
-void ReplayBlood() {
-    if (!g_bloodReplay || g_bloodTick != g_ticks) return;   // only what this very tick registered
-    for (int i = 0; i < g_bloodN; ++i) {
-        BloodCall& b = g_blood[i];
-        g_origBloodStore(b.a[0], b.a[1], b.a[2], reinterpret_cast<uint32_t>(b.pos), b.a[4], b.a[5], b.a[6], b.a[7], b.a[8], b.a[9],
-                         b.a[10], b.a[11], b.a[12], b.a[13], b.a[14], b.a[15], b.a[16]);
+void __fastcall HookedBreak(void* self, void*, float ts) {
+    if (g_logicHz <= 0 || !g_splitFx) { g_break.have = false; g_origBreak(self, ts); return; }
+    g_break.self = self; g_break.step = ts; g_break.have = true;
+    g_origBreak(self, ts * SplitFrac(g_break));
+}
+void SplitRenderOnly() {
+    if (!g_splitFx) return;
+    if (g_fx.have && g_origFx) g_origFx(g_fx.self, g_fx.cam, g_fx.step * SplitFrac(g_fx));
+    if (g_break.have && g_origBreak) {
+        // BreakObject_c::Update also counts calls: the object's frame counter (+0xC) goes up and each piece's life
+        // (+0x70, pieces of 0x74 bytes at +8, count at +4) goes down by one per call. Extra calls must not age them.
+        constexpr int MaxObjs = 64, MaxPieces = 128;
+        static uint32_t ctr[MaxObjs], life[MaxObjs][MaxPieces];
+        static uint8_t* pieces[MaxObjs];
+        static int count[MaxObjs];
+        auto* objs = static_cast<uint8_t*>(g_break.self);
+        __try {
+            for (int i = 0; i < MaxObjs; ++i) {
+                uint8_t* o = objs + 0x20 * i;
+                pieces[i] = nullptr;
+                if (!o[1]) continue;
+                pieces[i] = *reinterpret_cast<uint8_t**>(o + 8);
+                count[i] = *reinterpret_cast<int*>(o + 4);
+                ctr[i] = *reinterpret_cast<uint32_t*>(o + 0xC);
+                for (int k = 0; k < count[i] && k < MaxPieces; ++k) life[i][k] = *reinterpret_cast<uint32_t*>(pieces[i] + 0x74 * k + 0x70);
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+        g_origBreak(g_break.self, g_break.step * SplitFrac(g_break));
+        __try {
+            for (int i = 0; i < MaxObjs; ++i) {
+                uint8_t* o = objs + 0x20 * i;
+                // only if the object is still the same one (it may have been freed during the call)
+                if (!pieces[i] || !o[1] || *reinterpret_cast<uint8_t**>(o + 8) != pieces[i] || *reinterpret_cast<int*>(o + 4) != count[i]) continue;
+                *reinterpret_cast<uint32_t*>(o + 0xC) = ctr[i];
+                for (int k = 0; k < count[i] && k < MaxPieces; ++k) {
+                    uint32_t& l = *reinterpret_cast<uint32_t*>(pieces[i] + 0x74 * k + 0x70);
+                    if (l != 0) l = life[i][k];   // a piece that just expired stays expired
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
 }
 
 void __cdecl HookedConstructList() {
-    if (g_logicHz > 0 && g_renderOnly) ReplayBlood();
-    if (g_logicHz > 0) ShadowsAfterProcess(!g_renderOnly);
     // The sea fills draw buckets in this function once per simulated frame and the buckets are emptied when drawn,
     // so on render-only frames it has to run again or the water is missing.
     if (g_logicHz > 0 && g_renderOnly && g_waterRedo) reinterpret_cast<void(__cdecl*)()>(SITE_WaterFn)();
     const double t0 = Interp::NowUs();
     if (g_interpolate) Interp::ApplyEntities(TickAlpha());
+    if (g_logicHz > 0 && g_renderOnly) SplitRenderOnly();   // after the blend: effects follow the shown entities
+    // the camera too (blended again before RwCameraBeginUpdate): PreRender, shadows and effects see the shown one
+    if (g_interpolate) Interp::ApplyCamera(!g_renderOnly, TickAlpha());
     const double t1 = Interp::NowUs();
     g_origConstructList();
     const double t2 = Interp::NowUs();
@@ -559,9 +659,24 @@ void __cdecl HookedConstructList() {
     ++Interp::g_timing.frames;
 }
 
+// CRealTimeShadowManager::Update (0x706AB0, thiscall on 0xC40350) draws the ped shadows from their skeletons right
+// after PreRender: the skeletons are blended just before it, or the shadows keep the 30 Hz pose.
+constexpr uintptr_t SITE_RtShadows = 0x53EA0D, EXPECT_RtShadows = 0x706AB0;
+using RtShadowsFn = void(__fastcall*)(void*, void*);
+RtShadowsFn g_origRtShadows = nullptr;
+bool g_hierDone = false;
+void __fastcall HookedRtShadows(void* self, void* edx) {
+    if (g_interpolate) { Interp::ApplyHierarchies(!g_renderOnly, TickAlpha()); g_hierDone = true; }
+    g_origRtShadows(self, edx);
+}
+
 char __cdecl HookedCameraBegin(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e, uint32_t f, uint32_t g) {
     const double t0 = Interp::NowUs();
-    if (g_interpolate) { Interp::ApplyHierarchies(!g_renderOnly, TickAlpha()); Interp::ApplyCamera(!g_renderOnly, TickAlpha()); }
+    if (g_interpolate) {
+        if (!g_hierDone) Interp::ApplyHierarchies(!g_renderOnly, TickAlpha());
+        Interp::ApplyCamera(!g_renderOnly, TickAlpha());
+    }
+    g_hierDone = false;
     Interp::g_timing.applyCamUs += Interp::NowUs() - t0;
     return g_origCameraBegin(a, b, c, d, e, f, g);
 }
@@ -583,67 +698,11 @@ void LimitFrame() {
     }
     // If we fell behind (loading screen, hitch), restart the schedule instead of catching up.
     next.QuadPart = (now.QuadPart > next.QuadPart + period) ? now.QuadPart + period : next.QuadPart + period;
+    g_nextPresentQpc = next.QuadPart;   // when the next frame will be shown
 }
-
-
-
-// ---- draw probe (dev menu): lists draw calls that only happen on tick frames, with their callers -------------
-bool g_probe = false;
-struct DrawKey { unsigned api, a, b, c, d, caller[3]; unsigned long long tickCnt, rendCnt; bool used; };
-DrawKey g_tbl[1024];
-unsigned g_framesTick = 0, g_framesRend = 0;
-unsigned g_drawCounter = 0;
-double g_ssDraws[2];
-void NoteDraw(unsigned api, unsigned a, unsigned b, unsigned c2, unsigned d, uintptr_t* sp) {
-    ++g_drawCounter;
-    unsigned h = (api * 2654435761u) ^ (a * 40503u) ^ (b * 69069u) ^ (c2 * 1664525u) ^ (d * 22695477u);
-    for (int i = 0; i < 1024; ++i) {
-        DrawKey& k = g_tbl[(h + i) & 1023];
-        if (!k.used) {
-            k = DrawKey{}; k.used = true; k.api = api; k.a = a; k.b = b; k.c = c2; k.d = d;
-            int n = 0;
-            __try { for (int j = 1; j < 80 && n < 3; ++j) if (sp[j] >= 0x401000 && sp[j] < 0x8E0000) k.caller[n++] = unsigned(sp[j]); }
-            __except (EXCEPTION_EXECUTE_HANDLER) {}
-        }
-        if (k.api == api && k.a == a && k.b == b && k.c == c2 && k.d == d) { (g_renderOnly ? k.rendCnt : k.tickCnt)++; return; }
-    }
-}
-// shadow system probe: number of static shadows at the moment they are drawn
-VoidFn g_origStaticShadows1 = nullptr, g_origStaticShadows2 = nullptr;
-double g_ssSum[2][2]; unsigned g_ssN[2][2];
-void ReadStatic(int which) {
-    __try { g_ssSum[g_renderOnly][which] += *reinterpret_cast<volatile uint16_t*>(0xC403DC); ++g_ssN[g_renderOnly][which]; } __except (EXCEPTION_EXECUTE_HANDLER) {}
-}
-void __cdecl HookedStatic1() { if (g_probe) ReadStatic(0); g_origStaticShadows1(); }
-void __cdecl HookedStatic2() { if (g_probe) ReadStatic(1); const unsigned d0 = g_drawCounter; g_origStaticShadows2(); if (g_probe) g_ssDraws[g_renderOnly] += g_drawCounter - d0; }
-void ProbeEndFrame() {
-    if (!g_probe) return;
-    (g_renderOnly ? g_framesRend : g_framesTick)++;
-    if (g_framesTick + g_framesRend < 360) return;
-    Log("probe: static shadows at draw time: site1 tick %.2f (n=%u) render %.2f (n=%u); site2 tick %.2f (n=%u) render %.2f (n=%u)", g_ssN[0][0] ? g_ssSum[0][0] / g_ssN[0][0] : -1.0, g_ssN[0][0], g_ssN[1][0] ? g_ssSum[1][0] / g_ssN[1][0] : -1.0, g_ssN[1][0], g_ssN[0][1] ? g_ssSum[0][1] / g_ssN[0][1] : -1.0, g_ssN[0][1], g_ssN[1][1] ? g_ssSum[1][1] / g_ssN[1][1] : -1.0, g_ssN[1][1]);
-    Log("probe: draws inside RenderStaticShadows per frame: tick %.2f render %.2f", g_ssN[0][1] ? g_ssDraws[0] / g_ssN[0][1] : -1.0, g_ssN[1][1] ? g_ssDraws[1] / g_ssN[1][1] : -1.0);
-    g_ssDraws[0] = g_ssDraws[1] = 0;
-    memset(g_ssSum, 0, sizeof(g_ssSum)); memset(g_ssN, 0, sizeof(g_ssN));
-    Log("probe: tick-only draws over %u tick / %u render frames:", g_framesTick, g_framesRend);
-    for (auto& k : g_tbl) if (k.used && g_framesTick && g_framesRend) {
-        const double t = double(k.tickCnt) / g_framesTick, r = double(k.rendCnt) / g_framesRend;
-        if (t - r > 0.2) Log("  api=%u %u %u %u %u : tick %.2f render %.2f callers %08X %08X %08X", k.api, k.a, k.b, k.c, k.d, t, r, k.caller[0], k.caller[1], k.caller[2]);
-    }
-    memset(g_tbl, 0, sizeof(g_tbl)); g_framesTick = g_framesRend = 0;
-}
-using DP4 = HRESULT(WINAPI*)(void*, UINT, UINT, UINT);
-using DP7 = HRESULT(WINAPI*)(void*, UINT, INT, UINT, UINT, UINT, UINT);
-using DP5 = HRESULT(WINAPI*)(void*, UINT, UINT, const void*, UINT);
-using DP9 = HRESULT(WINAPI*)(void*, UINT, UINT, UINT, UINT, const void*, UINT, const void*, UINT);
-DP4 g_o81; DP7 g_o82; DP5 g_o83; DP9 g_o84;
-HRESULT WINAPI H81(void* d, UINT a, UINT b, UINT c) { if (g_probe) NoteDraw(81, a, b, c, 0, static_cast<uintptr_t*>(_AddressOfReturnAddress())); return g_o81(d, a, b, c); }
-HRESULT WINAPI H82(void* d, UINT a, INT b, UINT c, UINT e, UINT f, UINT g) { if (g_probe) NoteDraw(82, a, c, e, g, static_cast<uintptr_t*>(_AddressOfReturnAddress())); return g_o82(d, a, b, c, e, f, g); }
-HRESULT WINAPI H83(void* d, UINT a, UINT b, const void* c, UINT e) { if (g_probe) NoteDraw(83, a, b, e, 0, static_cast<uintptr_t*>(_AddressOfReturnAddress())); return g_o83(d, a, b, c, e); }
-HRESULT WINAPI H84(void* d, UINT a, UINT b, UINT c, UINT e, const void* f, UINT g, const void* h, UINT i) { if (g_probe) NoteDraw(84, a, b, c, e, static_cast<uintptr_t*>(_AddressOfReturnAddress())); return g_o84(d, a, b, c, e, f, g, h, i); }
 
 HRESULT WINAPI HookedPresent(void* dev, const RECT* src, const RECT* dst, HWND wnd, const void* dirty) {
     FlushGuard();
-    ProbeEndFrame();
     ++g_presentCount;
     Telemetry::OnFrame();
     if (g_borderless && g_bwnd) {   // the game restyles its window at times (caption/border): keep it borderless
@@ -658,15 +717,14 @@ HRESULT WINAPI HookedPresent(void* dev, const RECT* src, const RECT* dst, HWND w
             }
         }
     }
-    HRESULT hr = g_origPresent(dev, src, dst, wnd, dirty);
-    LimitFrame();
-    return hr;
+    LimitFrame();   // before Present: the frame is shown at its scheduled time (see FrameQpc)
+    return g_origPresent(dev, src, dst, wnd, dirty);
 }
 
 HRESULT WINAPI HookedCreateDevice(void* d3d, UINT adapter, UINT type, HWND wnd, DWORD flags,
                                   PresentParams* pp, void** outDev) {
     Fix(adapter, pp, "CreateDevice");
-    if (wnd) g_gameWnd = wnd;
+    if (wnd) { g_gameWnd = wnd; ApplyFpsCap(wnd); }
     HRESULT hr = g_origCreateDevice(d3d, adapter, type, wnd, flags, pp, outDev);
     if (hr == 0 && pp) ApplyBorderless(pp->hDeviceWindow ? pp->hDeviceWindow : wnd, pp);
     if (hr == 0 && outDev && *outDev && !g_origReset) {
@@ -674,13 +732,7 @@ HRESULT WINAPI HookedCreateDevice(void* d3d, UINT adapter, UINT type, HWND wnd, 
                          reinterpret_cast<void**>(&g_origReset)))
             Log("failed to hook Reset");
     }
-    if (hr == 0 && outDev && *outDev && !g_o81) {
-        PatchVTable(*outDev, 81, reinterpret_cast<void*>(&H81), reinterpret_cast<void**>(&g_o81));
-        PatchVTable(*outDev, 82, reinterpret_cast<void*>(&H82), reinterpret_cast<void**>(&g_o82));
-        PatchVTable(*outDev, 83, reinterpret_cast<void*>(&H83), reinterpret_cast<void**>(&g_o83));
-        PatchVTable(*outDev, 84, reinterpret_cast<void*>(&H84), reinterpret_cast<void**>(&g_o84));
-    }
-    if (hr == 0 && outDev && *outDev && (g_telemetry || g_fpsCap > 0) && !g_origPresent) {
+    if (hr == 0 && outDev && *outDev && !g_origPresent) {
         if (!PatchVTable(*outDev, VT_Present, reinterpret_cast<void*>(&HookedPresent),
                          reinterpret_cast<void**>(&g_origPresent)))
             Log("failed to hook Present");
@@ -701,10 +753,11 @@ void Init(HMODULE self) {
     if (g_log) { FILE* f = nullptr; if (_wfopen_s(&f, g_logPath, L"w") == 0 && f) fclose(f); }  // truncate
     g_fixRefresh = GetPrivateProfileIntW(L"Renewed120", L"RefreshRateFix", 1, ini) != 0;
     g_telemetry = GetPrivateProfileIntW(L"Renewed120", L"Telemetry", 0, ini) != 0;
-    g_fpsCap = static_cast<int>(GetPrivateProfileIntW(L"Renewed120", L"FpsCap", 0, ini));
+    g_fpsCapSetting = static_cast<int>(GetPrivateProfileIntW(L"Renewed120", L"FpsCap", 0, ini));
+    ApplyFpsCap(nullptr);
     g_logicHz = static_cast<int>(GetPrivateProfileIntW(L"Renewed120", L"LogicHz", 0, ini));
     if (g_logicHz < 0 || g_logicHz > 60) g_logicHz = 0;
-    if (!g_fixRefresh && !g_telemetry && g_fpsCap <= 0 && g_logicHz <= 0) { Log("all modules disabled"); return; }
+    if (!g_fixRefresh && !g_telemetry && g_fpsCapSetting < 0 && g_logicHz <= 0) { Log("all modules disabled"); return; }
     if (g_logicHz > 0) {
         if (HookCall(SITE_TimerUpdate, reinterpret_cast<void*>(&HookedTimerUpdate),
                      reinterpret_cast<void**>(&g_origTimerUpdate), EXPECT_TimerUpdate) &&
@@ -724,15 +777,24 @@ void Init(HMODULE self) {
                      reinterpret_cast<void**>(&g_origCameraBegin), EXPECT_CameraBegin)) {
             g_interpolate = GetPrivateProfileIntW(L"Renewed120", L"Interpolate", 1, ini) != 0;
             Log("interpolation hooks installed (enabled=%d)", int(g_interpolate));
+            if (HookCall(SITE_RtShadows, reinterpret_cast<void*>(&HookedRtShadows), reinterpret_cast<void**>(&g_origRtShadows), EXPECT_RtShadows))
+                Log("skeletons blended before the ped shadows");
         } else Log("interpolation hooks FAILED, running without interpolation");
     }
     if (g_logicHz > 0 && HookCall(SITE_PreRender, reinterpret_cast<void*>(&HookedPreRender), reinterpret_cast<void**>(&g_origPreRender), EXPECT_PreRender))
         Log("vehicle physics guard installed");
-    HookCall(0x53DDF2, reinterpret_cast<void*>(&HookedStatic1), reinterpret_cast<void**>(&g_origStaticShadows1), 0x70A960);
-    HookCall(0x53E0C8, reinterpret_cast<void*>(&HookedStatic2), reinterpret_cast<void**>(&g_origStaticShadows2), 0x70A960);
-    if (g_logicHz > 0 && GetPrivateProfileIntW(L"Renewed120", L"BloodFix", 1, ini) != 0 &&
-        HookCall(SITE_BloodStore, reinterpret_cast<void*>(&HookedBloodStore), reinterpret_cast<void**>(&g_origBloodStore), EXPECT_BloodStore))
-        Log("blood pool fix installed");
+    if (g_logicHz > 0 && PatchCarLightStep()) Log("car light step patch installed");
+    if (GetPrivateProfileIntW(L"Renewed120", L"SmoothCarLights", 1, ini) != 0 && PatchCarLightAlwaysMoving()) Log("car light per-frame patch installed");
+    g_staticFix = GetPrivateProfileIntW(L"Renewed120", L"StaticShadowFix", 1, ini) != 0;
+    if (g_logicHz > 0 &&
+        HookCall(SITE_UpdStatic1, reinterpret_cast<void*>(&HookedUpdStatic1), reinterpret_cast<void**>(&g_origUpdStatic1), EXPECT_UpdStatic) &&
+        HookCall(SITE_UpdStatic2, reinterpret_cast<void*>(&HookedUpdStatic2), reinterpret_cast<void**>(&g_origUpdStatic2), EXPECT_UpdStatic))
+        Log("static shadow fix installed (enabled=%d)", int(g_staticFix));
+    g_splitFx = GetPrivateProfileIntW(L"Renewed120", L"SmoothFx", 1, ini) != 0;
+    if (g_logicHz > 0 &&
+        HookCall(SITE_FxUpdate, reinterpret_cast<void*>(&HookedFx), reinterpret_cast<void**>(&g_origFx), EXPECT_FxUpdate) &&
+        HookCall(SITE_BreakUpdate, reinterpret_cast<void*>(&HookedBreak), reinterpret_cast<void**>(&g_origBreak), EXPECT_BreakUpdate))
+        Log("smooth particles/debris installed (enabled=%d)", int(g_splitFx));
     wcscpy_s(g_iniPath, ini);
     if (GetPrivateProfileIntW(L"Renewed120", L"DevMenu", 1, ini) != 0 &&
         HookCall(SITE_Render2d, reinterpret_cast<void*>(&HookedRender2d), reinterpret_cast<void**>(&g_origRender2d), EXPECT_Render2d))
@@ -741,15 +803,16 @@ void Init(HMODULE self) {
         wchar_t csv[MAX_PATH];
         swprintf_s(csv, L"%s.telemetry.csv", path);
         Telemetry::Start(csv);
-        Interp::SetDebug(GetPrivateProfileIntW(L"Renewed120", L"DebugCamera", 0, ini) != 0);
     }
     g_forceHz = static_cast<int>(GetPrivateProfileIntW(L"Renewed120", L"ForceHz", 0, ini));
     g_windowMode = static_cast<int>(GetPrivateProfileIntW(L"Renewed120", L"WindowMode", 1, ini));
     Interp::SetVehicleParts(GetPrivateProfileIntW(L"Renewed120", L"VehicleParts", 1, ini) != 0);
     Interp::SetPedSkeleton(GetPrivateProfileIntW(L"Renewed120", L"PedSkeleton", 1, ini) != 0);
+    Interp::SetCutsceneSkeleton(GetPrivateProfileIntW(L"Renewed120", L"CutsceneSkeleton", 1, ini) != 0);
+    g_streamEveryFrame = GetPrivateProfileIntW(L"Renewed120", L"StreamEveryFrame", 1, ini) != 0;
     g_waterRedo = GetPrivateProfileIntW(L"Renewed120", L"WaterFix", 1, ini) != 0;
     g_freezeVeh = GetPrivateProfileIntW(L"Renewed120", L"VehicleGuard", 1, ini) != 0;
-    g_shadowKeep = GetPrivateProfileIntW(L"Renewed120", L"ShadowKeep", 0, ini) != 0;
+    g_fixedStep = GetPrivateProfileIntW(L"Renewed120", L"FixedStep", 1, ini) != 0;
 
     HMODULE d3d9 = LoadLibraryW(L"d3d9.dll");
     using CreateFn = void*(WINAPI*)(UINT);
