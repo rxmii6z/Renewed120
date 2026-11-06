@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdarg>
 #include <cstdint>
+#include <cmath>
 #include <mmsystem.h>
 #include "telemetry.h"
 #include "interp.h"
@@ -310,6 +311,35 @@ bool PatchCarLightStep() {
 // Slow AI cars get their headlight patch as a cached static shadow (CShadows::StoreStaticShadow at 0x70C6E6), only
 // recomputed after the car moved a few cm: it crawled in jumps. The player's car always takes the per-frame path
 // (0x70C6F4); make every car take it ("je" at 0x70C68A -> "jmp").
+// Same for the car shadows (CShadows::StoreShadowForVehicle, 0x70BDA0): an AI car whose speed * CTimer::ms_fTimeStep
+// is small gets a cached static shadow (0x70C33F), only recomputed after it moved a few cm. On render-only frames the
+// time step is only the share of the tick (PreRender guard), so every AI car looked parked and its shadow stayed at
+// the tick position: 30 Hz. Make every car take the per-frame path like the player's car ("je" at 0x70C2C1 -> "jmp").
+bool g_carShadowPatched = false, g_smoothCarShadows = true;
+void SetVehShadowPatch(bool on) {
+    if (!g_carShadowPatched) return;
+    auto* p = reinterpret_cast<uint8_t*>(0x70C2C1);
+    const uint8_t je[6] = {0x0F, 0x84, 0xC4, 0x00, 0x00, 0x00}, jmp[6] = {0xE9, 0xC5, 0x00, 0x00, 0x00, 0x90};
+    DWORD old;
+    if (!VirtualProtect(p, 6, PAGE_EXECUTE_READWRITE, &old)) return;
+    std::memcpy(p, on ? jmp : je, 6);
+    VirtualProtect(p, 6, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, 6);
+    g_smoothCarShadows = on;
+}
+bool PatchVehShadowAlwaysMoving() {
+    auto* p = reinterpret_cast<uint8_t*>(0x70C2C1);
+    const uint8_t expect[6] = {0x0F, 0x84, 0xC4, 0x00, 0x00, 0x00};   // je 0x70C38B
+    if (std::memcmp(p, expect, 6) != 0) { Log("car shadow path patch: unexpected code, skipped"); return false; }
+    DWORD old;
+    if (!VirtualProtect(p, 6, PAGE_EXECUTE_READWRITE, &old)) return false;
+    const uint8_t jmp[6] = {0xE9, 0xC5, 0x00, 0x00, 0x00, 0x90};    // jmp 0x70C38B; nop
+    std::memcpy(p, jmp, 6);
+    g_carShadowPatched = true;
+    VirtualProtect(p, 6, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, 6);
+    return true;
+}
 bool PatchCarLightAlwaysMoving() {
     auto* p = reinterpret_cast<uint8_t*>(0x70C68A);
     if (p[0] != 0x74 || p[1] != 0x68) { Log("car light path patch: unexpected code, skipped"); return false; }
@@ -357,15 +387,19 @@ bool KeyPressed(int vk) {   // edge-triggered
     return hit;
 }
 
+bool g_smoothSun = true;   // see "sun direction and sun shadows"
+void RestoreSun();
+extern bool g_smoothCarShadows;
+void SetVehShadowPatch(bool on);
 void SaveIni() {
     auto put = [](const wchar_t* k, int v) { wchar_t b[16]; swprintf_s(b, L"%d", v); WritePrivateProfileStringW(L"Renewed120", k, b, g_iniPath); };
     put(L"Interpolate", g_interpolate); put(L"VehicleParts", Interp::VehicleParts()); put(L"PedSkeleton", Interp::PedSkeleton());
     put(L"CutsceneSkeleton", Interp::CutsceneSkeleton()); put(L"WaterFix", g_waterRedo); put(L"StaticShadowFix", g_staticFix);
-    put(L"SmoothFx", g_splitFx); put(L"StreamEveryFrame", g_streamEveryFrame); put(L"VehicleGuard", g_freezeVeh);
+    put(L"SmoothFx", g_splitFx); put(L"StreamEveryFrame", g_streamEveryFrame); put(L"VehicleGuard", g_freezeVeh); put(L"SmoothSun", g_smoothSun); put(L"SmoothCarShadows", g_smoothCarShadows);
     put(L"FpsCap", g_fpsCapSetting); put(L"LogicHz", g_logicHz);
 }
 
-constexpr int MenuItems = 12;
+constexpr int MenuItems = 14;
 void MenuChange(int dir) {   // dir: -1 / +1 (Enter = +1)
     switch (g_menuSel) {
     case 0: if (g_interpolate) Interp::Restore(); g_interpolate = !g_interpolate; break;
@@ -377,9 +411,11 @@ void MenuChange(int dir) {   // dir: -1 / +1 (Enter = +1)
     case 6: g_splitFx = !g_splitFx; break;
     case 7: g_streamEveryFrame = !g_streamEveryFrame; break;
     case 8: g_freezeVeh = !g_freezeVeh; break;
-    case 9: g_fpsCapSetting = FpsCaps[CycleIndex(FpsCaps, g_fpsCapSetting, dir)]; ApplyFpsCap(g_gameWnd); break;
-    case 10: g_logicHz = LogicRates[CycleIndex(LogicRates, g_logicHz, dir)]; break;
-    case 11: SaveIni(); break;
+    case 9: RestoreSun(); g_smoothSun = !g_smoothSun; break;
+    case 10: SetVehShadowPatch(!g_smoothCarShadows); break;
+    case 11: g_fpsCapSetting = FpsCaps[CycleIndex(FpsCaps, g_fpsCapSetting, dir)]; ApplyFpsCap(g_gameWnd); break;
+    case 12: g_logicHz = LogicRates[CycleIndex(LogicRates, g_logicHz, dir)]; break;
+    case 13: SaveIni(); break;
     }
 }
 
@@ -442,11 +478,13 @@ void DrawMenu() {
         case 6: name = "Smooth particles/debris"; onOff(g_splitFx); break;
         case 7: name = "Load models every frame"; onOff(g_streamEveryFrame); break;
         case 8: name = "Physics guard (veh+peds)"; onOff(g_freezeVeh); break;
-        case 9: name = "FPS cap";
+        case 9: name = "Smooth sun shadows"; onOff(g_smoothSun); break;
+        case 10: name = "Smooth car shadows"; onOff(g_smoothCarShadows); break;
+        case 11: name = "FPS cap";
             if (g_fpsCapSetting == 0) sprintf_s(val, "auto (%d)", g_fpsCap); else if (g_fpsCap > 0) sprintf_s(val, "%d", g_fpsCap); else strcpy_s(val, "off");
             break;
-        case 10: name = "Logic rate (Hz)"; sprintf_s(val, "%d", g_logicHz); break;
-        case 11: name = "Save to ini"; strcpy_s(val, "[Enter]"); break;
+        case 12: name = "Logic rate (Hz)"; sprintf_s(val, "%d", g_logicHz); break;
+        case 13: name = "Save to ini"; strcpy_s(val, "[Enter]"); break;
         }
         snprintf(line, sizeof(line), "%s %s: %s", i == g_menuSel ? ">" : " ", name, val);
         print(line, i == g_menuSel ? YELLOW : WHITE);
@@ -460,6 +498,7 @@ void __cdecl HookedRender2d() {
 }
 
 void FlushGuard();
+void RestoreSun();
 void __cdecl HookedTimerUpdate() {
     static LARGE_INTEGER freq, nextTick;
     if (g_logicHz <= 0) { g_origTimerUpdate(); return; }   // split disabled after a partial hook failure
@@ -486,6 +525,7 @@ void __cdecl HookedTimerUpdate() {
         RestoreWaterTiming();
         FlushGuard();
         Interp::Restore();   // the simulation must see the real, latest state
+        RestoreSun();
         const double t1 = Interp::NowUs();
         g_lastTickQpc = sched;   // on the fixed schedule: blend steps stay even
         g_tickPeriodQpc = period;
@@ -514,6 +554,52 @@ void __cdecl HookedTimerUpdate() {
 // The game calls it from CStreaming::Update in CGame::Process, i.e. once per tick: at 30 ticks/s the map, LODs and
 // cars loaded several times slower than in the original game running at a high frame rate. It is called alone on
 // the frames without a tick (what the original game does on every frame; nothing else of Update runs).
+// ---- sun direction and sun shadows ------------------------------------------------------------------------------
+// CTimeCycle::Update (CGame::Process, once per tick) moves the sun with the game clock: it writes the direction to the
+// sun (CTimeCycle::m_VectorToSun, vec3[16]) and the shadow vectors derived from it (CShadows::CalcPedShadowValues:
+// front, side and displacement, float[16] each) in slot m_CurrentStoredValue. The shadows of peds, vehicles and
+// objects are oriented with them, so they turned by small steps at 30 Hz while time passes. Drawn frames get the
+// blend of the last two ticks' values (like the entities); the real values are put back before each tick.
+constexpr uintptr_t ADDR_SunIndex = 0xB79FD0, ADDR_VectorToSun = 0xB7CA50;
+constexpr uintptr_t ADDR_SunShadow[6] = { 0xB79F90, 0xB79F50, 0xB79F10, 0xB79ED0, 0xB79E90, 0xB79E50 };
+struct SunState { int idx = -1; float v[9]{}; };   // vector to the sun, then the 6 shadow values
+SunState g_sunPrev, g_sunCur;
+bool g_sunApplied = false;
+void ReadSun(SunState& st) {
+    st.idx = *reinterpret_cast<const int*>(ADDR_SunIndex) & 15;
+    const float* sun = reinterpret_cast<const float*>(ADDR_VectorToSun) + 3 * st.idx;
+    for (int k = 0; k < 3; ++k) st.v[k] = sun[k];
+    for (int k = 0; k < 6; ++k) st.v[3 + k] = reinterpret_cast<const float*>(ADDR_SunShadow[k])[st.idx];
+}
+void WriteSun(int idx, const float* v) {
+    float* sun = reinterpret_cast<float*>(ADDR_VectorToSun) + 3 * idx;
+    for (int k = 0; k < 3; ++k) sun[k] = v[k];
+    for (int k = 0; k < 6; ++k) reinterpret_cast<float*>(ADDR_SunShadow[k])[idx] = v[3 + k];
+}
+void RestoreSun() {
+    if (g_sunApplied) WriteSun(g_sunCur.idx, g_sunCur.v);
+    g_sunApplied = false;
+}
+void OnTickSun() {
+    SunState now; ReadSun(now);
+    if (now.idx == g_sunCur.idx) return;   // CTimeCycle::Update did not run (menu, loading)
+    g_sunPrev = g_sunCur;
+    g_sunCur = now;
+    // a jump of the clock (load, sleep, cheat, cutscene time): no blend
+    const float* a = g_sunPrev.v; const float* b = g_sunCur.v;
+    if (g_sunPrev.idx < 0 || a[0] * b[0] + a[1] * b[1] + a[2] * b[2] < 0.999f) g_sunPrev = g_sunCur;
+}
+void ApplySun(float alpha) {
+    if (!g_smoothSun || g_sunCur.idx < 0 || g_sunPrev.idx < 0) return;
+    if ((*reinterpret_cast<const int*>(ADDR_SunIndex) & 15) != g_sunCur.idx) return;
+    float v[9];
+    for (int k = 0; k < 9; ++k) v[k] = g_sunPrev.v[k] + (g_sunCur.v[k] - g_sunPrev.v[k]) * alpha;
+    const float len = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (len > 1e-6f) for (int k = 0; k < 3; ++k) v[k] /= len;
+    WriteSun(g_sunCur.idx, v);
+    g_sunApplied = true;
+}
+
 constexpr uintptr_t ADDR_LoadRequestedModels = 0x40E3A0, ADDR_GameState = 0xC8D4C0;   // gGameState: 9 = playing
 bool g_streamEveryFrame = true;
 void __cdecl HookedGameProcess() {
@@ -525,6 +611,7 @@ void __cdecl HookedGameProcess() {
     }
     const double t0 = Interp::NowUs();
     g_origGameProcess();
+    OnTickSun();
     const double t1 = Interp::NowUs();
     if (g_interpolate) Interp::OnTick();
     const double t2 = Interp::NowUs();
@@ -642,6 +729,19 @@ void SplitRenderOnly() {
     }
 }
 
+// ---- car shadows at medium+ visual FX (stencil shadow volumes) ----------------------------------------------------
+// With Visual FX quality >= medium and a stencil buffer, the cars' shadows are volumes built from the shadow mesh of
+// their collision model by CStencilShadows::Process (0x711D90, call at 0x53C1AB in CGame::Process, i.e. once per
+// tick) and drawn every frame by CStencilShadows::Render. The volumes stayed at the tick position of the cars: 30 Hz
+// shadows. Build them again on every drawn frame, after the cars were blended (the call in Process is kept).
+constexpr uintptr_t ADDR_StencilShadowsProcess = 0x711D90;
+void UpdateStencilShadows() {
+    if (!g_smoothCarShadows || *reinterpret_cast<const int*>(ADDR_GameState) != 9 || *reinterpret_cast<const uint8_t*>(ADDR_MenuActive)) return;
+    const uint8_t* camMat = *reinterpret_cast<uint8_t* const*>(0xB6F03C);   // TheCamera.m_matrix (or its placement)
+    const float* camPos = camMat ? reinterpret_cast<const float*>(camMat + 0x30) : reinterpret_cast<const float*>(0xB6F02C);
+    reinterpret_cast<bool(__cdecl*)(const float*)>(ADDR_StencilShadowsProcess)(camPos);
+}
+
 void __cdecl HookedConstructList() {
     // The sea fills draw buckets in this function once per simulated frame and the buckets are emptied when drawn,
     // so on render-only frames it has to run again or the water is missing.
@@ -651,6 +751,8 @@ void __cdecl HookedConstructList() {
     if (g_logicHz > 0 && g_renderOnly) SplitRenderOnly();   // after the blend: effects follow the shown entities
     // the camera too (blended again before RwCameraBeginUpdate): PreRender, shadows and effects see the shown one
     if (g_interpolate) Interp::ApplyCamera(!g_renderOnly, TickAlpha());
+    if (g_interpolate && g_logicHz > 0) ApplySun(TickAlpha()); else RestoreSun();
+    if (g_interpolate && g_logicHz > 0) UpdateStencilShadows();
     const double t1 = Interp::NowUs();
     g_origConstructList();
     const double t2 = Interp::NowUs();
@@ -817,7 +919,12 @@ void Init(HMODULE self) {
     if (g_logicHz > 0 && HookCall(SITE_PreRender, reinterpret_cast<void*>(&HookedPreRender), reinterpret_cast<void**>(&g_origPreRender), EXPECT_PreRender))
         Log("vehicle physics guard installed");
     if (g_logicHz > 0 && PatchCarLightStep()) Log("car light step patch installed");
+    g_smoothSun = GetPrivateProfileIntW(L"Renewed120", L"SmoothSun", 1, ini) != 0;
     if (GetPrivateProfileIntW(L"Renewed120", L"SmoothCarLights", 1, ini) != 0 && PatchCarLightAlwaysMoving()) Log("car light per-frame patch installed");
+    if (PatchVehShadowAlwaysMoving()) {
+        SetVehShadowPatch(GetPrivateProfileIntW(L"Renewed120", L"SmoothCarShadows", 1, ini) != 0);
+        Log("car shadow per-frame patch installed (enabled=%d)", int(g_smoothCarShadows));
+    }
     g_staticFix = GetPrivateProfileIntW(L"Renewed120", L"StaticShadowFix", 1, ini) != 0;
     if (g_logicHz > 0 &&
         HookCall(SITE_UpdStatic1, reinterpret_cast<void*>(&HookedUpdStatic1), reinterpret_cast<void**>(&g_origUpdStatic1), EXPECT_UpdStatic) &&

@@ -30,6 +30,8 @@ frame rate (as high as your monitor) without breaking the game.
 - blood pools and other fixed shadows kept between steps (`StaticShadowFix`)
 - particles (smoke, sparks...) and broken object pieces animated on every frame (`SmoothFx`)
 - headlight patches of AI cars on the ground recomputed every frame (`SmoothCarLights`)
+- car shadows follow the cars on every frame, both the simple shadows (low visual FX) and the shadow volumes (medium and above) (`SmoothCarShadows`)
+- the sun and the shadows it casts move smoothly as the time of day passes (`SmoothSun`)
 - map models and LODs loaded from disk as fast as in the original game (`StreamEveryFrame`)
 
 **Developer tools**
