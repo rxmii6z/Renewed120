@@ -493,8 +493,10 @@ void DrawMenu() {
 }
 
 void __cdecl HookedRender2d() {
+    Telemetry::Stamp(Telemetry::M_HudStart);
     g_origRender2d();
     DrawMenu();
+    Telemetry::Stamp(Telemetry::M_HudEnd);
 }
 
 void FlushGuard();
@@ -605,10 +607,13 @@ bool g_streamEveryFrame = true;
 void __cdecl HookedGameProcess() {
     if (g_logicHz > 0 && g_renderOnly) {
         // only in the running game (gGameState 9), never in the pause/main menu (FrontEndMenuManager.m_bMenuActive)
+        Telemetry::Stamp(Telemetry::M_LogicStart);
         if (g_streamEveryFrame && *reinterpret_cast<const int*>(ADDR_GameState) == 9 && !*reinterpret_cast<const uint8_t*>(ADDR_MenuActive))
             reinterpret_cast<VoidFn>(ADDR_LoadRequestedModels)();
+        Telemetry::Stamp(Telemetry::M_LogicEnd);
         return;
     }
+    Telemetry::Stamp(Telemetry::M_LogicStart);
     const double t0 = Interp::NowUs();
     g_origGameProcess();
     OnTickSun();
@@ -617,6 +622,7 @@ void __cdecl HookedGameProcess() {
     const double t2 = Interp::NowUs();
     Interp::g_timing.processUs += t1 - t0;
     Interp::g_timing.onTickUs += t2 - t1;
+    Telemetry::Stamp(Telemetry::M_LogicEnd);
 }
 
 // CRenderer::PreRender (called right after ConstructRenderList): see Interp::SaveVehicles.
@@ -630,7 +636,13 @@ void FlushGuard() {
     g_guardPending = false;
 }
 
+void PreRenderBody();
 void __cdecl HookedPreRender() {
+    Telemetry::Stamp(Telemetry::M_PreStart);
+    PreRenderBody();
+    Telemetry::Stamp(Telemetry::M_PreEnd);
+}
+void PreRenderBody() {
     if (g_interpolate) Interp::CapturePedFrames(!g_renderOnly);
     if (g_logicHz <= 0 || !g_freezeVeh) { g_origPreRender(); return; }
     float* ts = reinterpret_cast<float*>(ADDR_TimeStepF);
@@ -742,7 +754,34 @@ void UpdateStencilShadows() {
     reinterpret_cast<bool(__cdecl*)(const float*)>(ADDR_StencilShadowsProcess)(camPos);
 }
 
+// CAudioEngine::Service (0x507750, thiscall on AudioEngine 0xB6BC90) updates every sound entity (each car, ped...) and
+// costs 1.3-2 ms with dense traffic. The original game ran it once per logic frame (30 per second); with 180 drawn
+// frames it ran 6 times as often for nothing. AudioAtLogicRate keeps it on tick frames only.
+// The RW call after it is hooked for the profiler only (Telemetry=1).
+constexpr uintptr_t SITE_Audio = 0x53E98B, EXPECT_Audio = 0x507750, SITE_RwBegin = 0x53E997, EXPECT_RwBegin = 0x7354E0;
+using ThisFn = void(__fastcall*)(void*, void*);
+using RwBeginFn = int(__cdecl*)(void*);
+ThisFn g_origAudio = nullptr;
+RwBeginFn g_origRwBegin = nullptr;
+// It runs on the drawn frame right after each tick, not in the tick frame itself: the tick frame already carries the
+// whole simulation, so the two costs land on two frames (the timer does not move in between, so the sound sees the
+// same time step). Two ticks in a row (menus, hitches): the pending update runs at once.
+bool g_audioTickRate = true, g_audioPending = false;
+void __fastcall HookedAudio(void* self, void* edx) {
+    if (!(g_audioTickRate && g_logicHz > 0)) g_origAudio(self, edx);
+    else if (!g_renderOnly) {
+        if (g_audioPending) g_origAudio(self, edx);
+        g_audioPending = true;
+    } else if (g_audioPending) {
+        g_origAudio(self, edx);
+        g_audioPending = false;
+    }
+    Telemetry::Stamp(Telemetry::M_AudioEnd);
+}
+int __cdecl HookedRwBegin(void* p) { const int r = g_origRwBegin(p); Telemetry::Stamp(Telemetry::M_RwBeginEnd); return r; }
+
 void __cdecl HookedConstructList() {
+    Telemetry::Stamp(Telemetry::M_ListStart);
     // The sea fills draw buckets in this function once per simulated frame and the buckets are emptied when drawn,
     // so on render-only frames it has to run again or the water is missing.
     if (g_logicHz > 0 && g_renderOnly && g_waterRedo) reinterpret_cast<void(__cdecl*)()>(SITE_WaterFn)();
@@ -753,12 +792,14 @@ void __cdecl HookedConstructList() {
     if (g_interpolate) Interp::ApplyCamera(!g_renderOnly, TickAlpha());
     if (g_interpolate && g_logicHz > 0) ApplySun(TickAlpha()); else RestoreSun();
     if (g_interpolate && g_logicHz > 0) UpdateStencilShadows();
+    Telemetry::Stamp(Telemetry::M_BlendEnd);
     const double t1 = Interp::NowUs();
     g_origConstructList();
     const double t2 = Interp::NowUs();
     Interp::g_timing.applyEntUs += t1 - t0;
     Interp::g_timing.constructUs += t2 - t1;
     ++Interp::g_timing.frames;
+    Telemetry::Stamp(Telemetry::M_ListEnd);
 }
 
 // CRealTimeShadowManager::Update (0x706AB0, thiscall on 0xC40350) draws the ped shadows from their skeletons right
@@ -780,6 +821,7 @@ char __cdecl HookedCameraBegin(uint32_t a, uint32_t b, uint32_t c, uint32_t d, u
     }
     g_hierDone = false;
     Interp::g_timing.applyCamUs += Interp::NowUs() - t0;
+    Telemetry::Stamp(Telemetry::M_SceneStart);
     return g_origCameraBegin(a, b, c, d, e, f, g);
 }
 
@@ -836,6 +878,7 @@ const int* __cdecl HookedVideoModes() {
 }
 
 HRESULT WINAPI HookedPresent(void* dev, const RECT* src, const RECT* dst, HWND wnd, const void* dirty) {
+    Telemetry::Stamp(Telemetry::M_PresentHook);
     if (g_noFrameLimiter) *reinterpret_cast<volatile uint8_t*>(ADDR_FrameLimiter) = 0;   // the menu or gta_sa.set may turn it on
     FlushGuard();
     ++g_presentCount;
@@ -852,8 +895,13 @@ HRESULT WINAPI HookedPresent(void* dev, const RECT* src, const RECT* dst, HWND w
             }
         }
     }
+    Telemetry::Stamp(Telemetry::M_PresentIn);
     LimitFrame();   // before Present: the frame is shown at its scheduled time (see FrameQpc)
-    return g_origPresent(dev, src, dst, wnd, dirty);
+    Telemetry::Stamp(Telemetry::M_WaitEnd);
+    const HRESULT hr = g_origPresent(dev, src, dst, wnd, dirty);
+    Telemetry::EndFrame(!g_renderOnly, *reinterpret_cast<const int*>(ADDR_GameState) == 9 &&
+                                           !*reinterpret_cast<const volatile uint8_t*>(ADDR_MenuActive));
+    return hr;
 }
 
 HRESULT WINAPI HookedCreateDevice(void* d3d, UINT adapter, UINT type, HWND wnd, DWORD flags,
@@ -943,6 +991,13 @@ void Init(HMODULE self) {
         wchar_t csv[MAX_PATH];
         swprintf_s(csv, L"%s.telemetry.csv", path);
         Telemetry::Start(csv);
+    }
+    g_audioTickRate = GetPrivateProfileIntW(L"Renewed120", L"AudioAtLogicRate", 1, ini) != 0;
+    if ((g_telemetry || (g_audioTickRate && g_logicHz > 0)) &&
+        HookCall(SITE_Audio, reinterpret_cast<void*>(&HookedAudio), reinterpret_cast<void**>(&g_origAudio), EXPECT_Audio))
+        Log("audio service: %s", g_audioTickRate && g_logicHz > 0 ? "logic rate" : "every frame");
+    if (g_telemetry) {
+        HookCall(SITE_RwBegin, reinterpret_cast<void*>(&HookedRwBegin), reinterpret_cast<void**>(&g_origRwBegin), EXPECT_RwBegin);
     }
     g_noFrameLimiter = GetPrivateProfileIntW(L"Renewed120", L"NoFrameLimiter", 1, ini) != 0;
     if (GetPrivateProfileIntW(L"Renewed120", L"DesktopResolution", 1, ini) != 0 &&

@@ -134,4 +134,60 @@ void OnFrame() {
     g_frames = 0; g_sumFt = g_maxFt = g_sumStep = 0; g_secStart = now;
 }
 
+// ---- frame profiler ---------------------------------------------------------------------------------------
+namespace {
+// segment k = time from the previous stamp to stamp k (k = M_Count: Present itself, up to the end of the frame)
+const char* const kSeg[M_Count + 1] = {"pre", "logic", "audio", "rwbegin", "mid", "blend", "list", "mid2", "prerender",
+                                       "shadows", "scene", "hud", "endframe", "guard", "wait", "present"};
+LONGLONG g_stamp[M_Count], g_frameStart;
+struct Acc { unsigned n; double seg[M_Count + 1], total, maxTotal, worst[M_Count + 1]; };
+Acc g_acc[2];   // [0] render-only frames, [1] tick frames
+LARGE_INTEGER g_profSec;
+
+void WriteAcc(double real, const char* kind, const Acc& a) {
+    if (!a.n) return;
+    char buf[900]; int len = snprintf(buf, sizeof buf, "P,%.2f,%s,frames=%u,avgMs=%.2f,maxMs=%.2f", real, kind, a.n, a.total / a.n, a.maxTotal);
+    for (int k = 0; k <= M_Count; ++k) len += snprintf(buf + len, sizeof buf - len, ",%s=%.2f", kSeg[k], a.seg[k] / a.n);
+    len += snprintf(buf + len, sizeof buf - len, " | worst:");
+    for (int k = 0; k <= M_Count; ++k) len += snprintf(buf + len, sizeof buf - len, " %s=%.2f", kSeg[k], a.worst[k]);
+    snprintf(buf + len, sizeof buf - len, "\n");
+    Write("%s", buf);
+}
+}  // namespace
+
+void Stamp(int mark) {
+    if (!g_on || mark < 0 || mark >= M_Count) return;
+    LARGE_INTEGER q; QueryPerformanceCounter(&q);
+    g_stamp[mark] = q.QuadPart;
+}
+
+void EndFrame(bool tick, bool playing) {
+    if (!g_on) return;
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    if (!g_profSec.QuadPart) g_profSec = now;
+    if (g_frameStart && playing) {
+        const double toMs = 1000.0 / double(g_freq.QuadPart);
+        double seg[M_Count + 1] = {};
+        LONGLONG prev = g_frameStart;
+        for (int k = 0; k <= M_Count; ++k) {
+            const LONGLONG t = k < M_Count ? g_stamp[k] : now.QuadPart;
+            if (!t || t < prev) continue;   // stamp missing this frame: its time goes to the next segment
+            seg[k] = double(t - prev) * toMs; prev = t;
+        }
+        const double total = double(now.QuadPart - g_frameStart) * toMs;
+        Acc& a = g_acc[tick ? 1 : 0];
+        ++a.n; a.total += total;
+        for (int k = 0; k <= M_Count; ++k) a.seg[k] += seg[k];
+        if (total > a.maxTotal) { a.maxTotal = total; for (int k = 0; k <= M_Count; ++k) a.worst[k] = seg[k]; }
+    }
+    for (LONGLONG& s : g_stamp) s = 0;
+    g_frameStart = now.QuadPart;
+    if (Secs(g_profSec, now) < 1.0) return;
+    const double real = Secs(g_t0, now);
+    WriteAcc(real, "tick", g_acc[1]);
+    WriteAcc(real, "render", g_acc[0]);
+    g_acc[0] = g_acc[1] = Acc{};
+    g_profSec = now;
+}
+
 }  // namespace Telemetry

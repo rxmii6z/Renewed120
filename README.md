@@ -34,9 +34,12 @@ frame rate (as high as your monitor) without breaking the game.
 - the sun and the shadows it casts move smoothly as the time of day passes (`SmoothSun`)
 - map models and LODs loaded from disk as fast as in the original game (`StreamEveryFrame`)
 
+**Performance**
+- sounds updated once per simulation step like the original game, on the frame after the step, instead of on every drawn frame: 1-2 ms saved per frame in dense traffic (`AudioAtLogicRate`)
+
 **Developer tools**
 - in-game developer menu on **F9**: toggle every feature live and save the settings to the ini (`DevMenu`)
-- log file (`Log`) and optional telemetry CSV with FPS, frame times and the time spent in the mod (`Telemetry`)
+- log file (`Log`) and optional telemetry CSV with FPS, frame times, the time of each step of the frame and the time spent in the mod (`Telemetry`, off by default)
 
 Every option is explained in [Renewed120.ini](Renewed120.ini).
 

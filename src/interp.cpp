@@ -37,7 +37,7 @@ struct Slot {
     Pose prev{}, curr{};
 };
 
-constexpr int MaxPed = 256, MaxVeh = 256, MaxObj = 1024;
+constexpr int MaxPed = 512, MaxVeh = 512, MaxObj = 1024;
 Slot g_ped[MaxPed], g_veh[MaxVeh], g_obj[MaxObj];
 
 // Child frames of a clump (wheels, doors, parts of cutscene objects): animated by the game once per tick.
