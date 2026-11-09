@@ -7,6 +7,8 @@ Renewed120 separates the two. The world is simulated at a fixed rate (30 Hz by d
 game, and every frame drawn in between shows a smooth blend of the last two simulated states. The result is a high
 frame rate (as high as your monitor) without breaking the game.
 
+<img width="1671" height="941" alt="rendering" src="https://github.com/user-attachments/assets/5f4dd97c-2169-4fee-81cc-472cbd4d44fc" />
+
 ## Features
 
 **Display**
