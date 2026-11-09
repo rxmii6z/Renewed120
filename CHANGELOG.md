@@ -5,6 +5,8 @@
 Everything that still moved at 30 fps while the rest of the game runs at your monitor's rate.
 
 ### Fixed
+- **3D markers** (entrance markers of buildings, red mission rings and arrows) are visible again: they
+  disappeared on the frames drawn between simulation steps (issue #1).
 - **Sea waves** move smoothly. Before, their height only changed 30 times per second.
 - **Weapons and pickups on the ground** (health, armour, money...) spin and glow smoothly.
 - **Bike, motorbike and BMX shadows** no longer split into two faint shadows that drift further apart the faster you
