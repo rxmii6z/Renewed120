@@ -274,7 +274,7 @@ void RestoreWaterTiming() {
 
 char __cdecl HookedWaterGate() {
     if (g_logicHz > 0) {
-        LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        LARGE_INTEGER now; now.QuadPart = FrameQpc();   // shown time of this frame, see SplitFrac
         if (!g_waterSaved) {
             g_savedStep = *reinterpret_cast<float*>(ADDR_TimeStepF);
             g_savedCtr = *reinterpret_cast<uint32_t*>(ADDR_FrameCtrW);
@@ -291,6 +291,36 @@ char __cdecl HookedWaterGate() {
     }
     return g_origWaterGate();
 }
+
+// ---- game clock while drawing -------------------------------------------------------------------------------
+// Several things animate from CTimer::m_snTimeInMilliseconds, which only moves on simulated ticks: the height of the
+// waves (CWaterLevel, sin of the clock) and the spin of pickups (weapons, health, money...). On render-only frames
+// the clock is moved ahead by the share of the tick that elapsed, only around the draw code of these systems (nothing
+// stores the shifted value: they only read it), then put back.
+constexpr uintptr_t ADDR_TimeMs = 0xB7CB84;
+bool     g_smoothClock = true;
+uint32_t g_tickMs = 0, g_lastTickTimeMs = 0;   // game ms the last tick advanced the clock by
+uint32_t ClockAheadMs() {
+    if (!g_smoothClock || g_logicHz <= 0 || !g_renderOnly || *reinterpret_cast<const uint8_t*>(ADDR_MenuActive)) return 0;
+    const float a = TickAlpha();
+    return uint32_t(float(g_tickMs) * a);
+}
+struct ClockShift {
+    uint32_t saved; bool on;
+    ClockShift() : saved(*reinterpret_cast<volatile uint32_t*>(ADDR_TimeMs)), on(false) {
+        const uint32_t ahead = ClockAheadMs();
+        if (ahead) { *reinterpret_cast<volatile uint32_t*>(ADDR_TimeMs) = saved + ahead; on = true; }
+    }
+    ~ClockShift() { if (on) *reinterpret_cast<volatile uint32_t*>(ADDR_TimeMs) = saved; }
+};
+// CWaterLevel::RenderWater (0x6EF650, called at the three sites below) and the pickups' spin / glow (0x4560E0, called
+// from the object pre-render at 0x536961 with the object).
+constexpr uintptr_t SITE_RenderWater1 = 0x53DD31, SITE_RenderWater2 = 0x53E004, SITE_RenderWater3 = 0x53E142, EXPECT_RenderWater = 0x6EF650;
+constexpr uintptr_t SITE_PickupFx = 0x536961, EXPECT_PickupFx = 0x4560E0;
+VoidFn g_origRenderWater = nullptr;
+void (__cdecl* g_origPickupFx)(void*) = nullptr;
+void __cdecl HookedRenderWater() { ClockShift shift; g_origRenderWater(); }
+void __cdecl HookedPickupFx(void* ent) { ClockShift shift; g_origPickupFx(ent); }
 
 // ---- car headlight patches on the ground ------------------------------------------------------------------
 // CShadows::StoreCarLightShadow picks the headlight patch of AI cars from "speed x ms_fTimeStep" (fmul at 0x70C679).
@@ -390,32 +420,44 @@ bool KeyPressed(int vk) {   // edge-triggered
 bool g_smoothSun = true;   // see "sun direction and sun shadows"
 void RestoreSun();
 extern bool g_smoothCarShadows;
+extern bool g_stencilFrame;
+extern bool g_smoothSparks;
 void SetVehShadowPatch(bool on);
 void SaveIni() {
     auto put = [](const wchar_t* k, int v) { wchar_t b[16]; swprintf_s(b, L"%d", v); WritePrivateProfileStringW(L"Renewed120", k, b, g_iniPath); };
     put(L"Interpolate", g_interpolate); put(L"VehicleParts", Interp::VehicleParts()); put(L"PedSkeleton", Interp::PedSkeleton());
     put(L"CutsceneSkeleton", Interp::CutsceneSkeleton()); put(L"WaterFix", g_waterRedo); put(L"StaticShadowFix", g_staticFix);
     put(L"SmoothFx", g_splitFx); put(L"StreamEveryFrame", g_streamEveryFrame); put(L"VehicleGuard", g_freezeVeh); put(L"SmoothSun", g_smoothSun); put(L"SmoothCarShadows", g_smoothCarShadows);
+    put(L"SmoothClock", g_smoothClock); put(L"CarStencilEachFrame", g_stencilFrame); put(L"SmoothSparks", g_smoothSparks);
     put(L"FpsCap", g_fpsCapSetting); put(L"LogicHz", g_logicHz);
 }
 
-constexpr int MenuItems = 14;
+// Menu lines in display order (the ini keys are written by SaveIni).
+enum MenuId {
+    M_Interp, M_VehParts, M_PedSkel, M_CutSkel, M_Guard,
+    M_Water, M_Clock, M_Fx, M_Sparks,
+    M_StaticShadows, M_Sun, M_CarBlob, M_CarStencil,
+    M_Stream, M_FpsCap, M_LogicHz, M_Save, MenuItems
+};
 void MenuChange(int dir) {   // dir: -1 / +1 (Enter = +1)
     switch (g_menuSel) {
-    case 0: if (g_interpolate) Interp::Restore(); g_interpolate = !g_interpolate; break;
-    case 1: Interp::Restore(); Interp::SetVehicleParts(!Interp::VehicleParts()); break;
-    case 2: Interp::Restore(); Interp::SetPedSkeleton(!Interp::PedSkeleton()); break;
-    case 3: Interp::Restore(); Interp::SetCutsceneSkeleton(!Interp::CutsceneSkeleton()); break;
-    case 4: g_waterRedo = !g_waterRedo; break;
-    case 5: g_staticFix = !g_staticFix; break;
-    case 6: g_splitFx = !g_splitFx; break;
-    case 7: g_streamEveryFrame = !g_streamEveryFrame; break;
-    case 8: g_freezeVeh = !g_freezeVeh; break;
-    case 9: RestoreSun(); g_smoothSun = !g_smoothSun; break;
-    case 10: SetVehShadowPatch(!g_smoothCarShadows); break;
-    case 11: g_fpsCapSetting = FpsCaps[CycleIndex(FpsCaps, g_fpsCapSetting, dir)]; ApplyFpsCap(g_gameWnd); break;
-    case 12: g_logicHz = LogicRates[CycleIndex(LogicRates, g_logicHz, dir)]; break;
-    case 13: SaveIni(); break;
+    case M_Interp: if (g_interpolate) Interp::Restore(); g_interpolate = !g_interpolate; break;
+    case M_VehParts: Interp::Restore(); Interp::SetVehicleParts(!Interp::VehicleParts()); break;
+    case M_PedSkel: Interp::Restore(); Interp::SetPedSkeleton(!Interp::PedSkeleton()); break;
+    case M_CutSkel: Interp::Restore(); Interp::SetCutsceneSkeleton(!Interp::CutsceneSkeleton()); break;
+    case M_Guard: g_freezeVeh = !g_freezeVeh; break;
+    case M_Water: g_waterRedo = !g_waterRedo; break;
+    case M_Clock: g_smoothClock = !g_smoothClock; break;
+    case M_Fx: g_splitFx = !g_splitFx; break;
+    case M_Sparks: g_smoothSparks = !g_smoothSparks; break;
+    case M_StaticShadows: g_staticFix = !g_staticFix; break;
+    case M_Sun: RestoreSun(); g_smoothSun = !g_smoothSun; break;
+    case M_CarBlob: SetVehShadowPatch(!g_smoothCarShadows); break;
+    case M_CarStencil: g_stencilFrame = !g_stencilFrame; break;
+    case M_Stream: g_streamEveryFrame = !g_streamEveryFrame; break;
+    case M_FpsCap: g_fpsCapSetting = FpsCaps[CycleIndex(FpsCaps, g_fpsCapSetting, dir)]; ApplyFpsCap(g_gameWnd); break;
+    case M_LogicHz: g_logicHz = LogicRates[CycleIndex(LogicRates, g_logicHz, dir)]; break;
+    case M_Save: SaveIni(); break;
     }
 }
 
@@ -469,22 +511,25 @@ void DrawMenu() {
         const char* name = ""; val[0] = 0;
         auto onOff = [&](bool v) { strcpy_s(val, v ? "ON" : "OFF"); };
         switch (i) {
-        case 0: name = "Interpolation"; onOff(g_interpolate); break;
-        case 1: name = "Vehicle parts (wheels/doors)"; onOff(Interp::VehicleParts()); break;
-        case 2: name = "Ped skeleton"; onOff(Interp::PedSkeleton()); break;
-        case 3: name = "Cutscene skeletons"; onOff(Interp::CutsceneSkeleton()); break;
-        case 4: name = "Water fix"; onOff(g_waterRedo); break;
-        case 5: name = "Static shadow fix (blood)"; onOff(g_staticFix); break;
-        case 6: name = "Smooth particles/debris"; onOff(g_splitFx); break;
-        case 7: name = "Load models every frame"; onOff(g_streamEveryFrame); break;
-        case 8: name = "Physics guard (veh+peds)"; onOff(g_freezeVeh); break;
-        case 9: name = "Smooth sun shadows"; onOff(g_smoothSun); break;
-        case 10: name = "Smooth car shadows"; onOff(g_smoothCarShadows); break;
-        case 11: name = "FPS cap";
+        case M_Interp: name = "Interpolation"; onOff(g_interpolate); break;
+        case M_VehParts: name = "Vehicle parts (wheels/doors)"; onOff(Interp::VehicleParts()); break;
+        case M_PedSkel: name = "Ped skeletons"; onOff(Interp::PedSkeleton()); break;
+        case M_CutSkel: name = "Cutscene skeletons"; onOff(Interp::CutsceneSkeleton()); break;
+        case M_Guard: name = "Physics guard (vehicles/peds)"; onOff(g_freezeVeh); break;
+        case M_Water: name = "Water fix"; onOff(g_waterRedo); break;
+        case M_Clock: name = "Smooth waves/pickups"; onOff(g_smoothClock); break;
+        case M_Fx: name = "Smooth particles/debris"; onOff(g_splitFx); break;
+        case M_Sparks: name = "Smooth sparks/dust emission"; onOff(g_smoothSparks); break;
+        case M_StaticShadows: name = "Static shadows (blood pools)"; onOff(g_staticFix); break;
+        case M_Sun: name = "Smooth sun shadows"; onOff(g_smoothSun); break;
+        case M_CarBlob: name = "Car shadows, low FX (blob)"; onOff(g_smoothCarShadows); break;
+        case M_CarStencil: name = "Car shadows, medium+ FX (stencil)"; onOff(g_stencilFrame); break;
+        case M_Stream: name = "Load models every frame"; onOff(g_streamEveryFrame); break;
+        case M_FpsCap: name = "FPS cap";
             if (g_fpsCapSetting == 0) sprintf_s(val, "auto (%d)", g_fpsCap); else if (g_fpsCap > 0) sprintf_s(val, "%d", g_fpsCap); else strcpy_s(val, "off");
             break;
-        case 12: name = "Logic rate (Hz)"; sprintf_s(val, "%d", g_logicHz); break;
-        case 13: name = "Save to ini"; strcpy_s(val, "[Enter]"); break;
+        case M_LogicHz: name = "Logic rate (Hz)"; sprintf_s(val, "%d", g_logicHz); break;
+        case M_Save: name = "Save to ini"; strcpy_s(val, "[Enter]"); break;
         }
         snprintf(line, sizeof(line), "%s %s: %s", i == g_menuSel ? ">" : " ", name, val);
         print(line, i == g_menuSel ? YELLOW : WHITE);
@@ -532,6 +577,11 @@ void __cdecl HookedTimerUpdate() {
         g_lastTickQpc = sched;   // on the fixed schedule: blend steps stay even
         g_tickPeriodQpc = period;
         g_origTimerUpdate();
+        {
+            const uint32_t now32 = *reinterpret_cast<const uint32_t*>(ADDR_TimeMs);
+            g_tickMs = (g_lastTickTimeMs && now32 >= g_lastTickTimeMs && now32 - g_lastTickTimeMs < 200) ? now32 - g_lastTickTimeMs : 0;
+            g_lastTickTimeMs = now32;
+        }
         // CTimer measures the real time since the previous tick, which wobbles by a few ms around the schedule;
         // the blend assumes exactly one period per tick, so a wobbling step made moving things speed up and slow
         // down every tick. Simulate exactly one period (keeping the game's time scale; pauses keep their 0 step).
@@ -602,6 +652,245 @@ void ApplySun(float alpha) {
     g_sunApplied = true;
 }
 
+// ---- sparks (and the other effects the simulation emits) ---------------------------------------------------------
+// Collisions, scraping, bullets and wheels add their particles to the permanent effect systems of Fx_c (g_fx 0xA9AE00:
+// +0x24 exhaust smoke, +0x28 spark, +0x2C spark with blur, dust, debris, collision smoke, blood...) through
+// FxSystem_c::AddParticle (0x4AA440, thiscall: pos, vel, timeSince, FxPrtMult_c*, zRot, light, lightLimit, local;
+// ret 0x20). The simulation only runs on tick frames, so every tick dropped its whole burst at once: 30 bursts per
+// second however smooth the particles then move. The particles added during a tick are queued and released over the
+// following drawn frames (ReleaseParticles).
+constexpr uintptr_t ADDR_AddParticle = 0x4AA440, ADDR_FxC = 0xA9AE00;
+constexpr int FxCSystems = 18;   // FxSystem_c* fields of Fx_c (+0x00..+0x44)
+struct FxMult { float f[7]; };   // FxPrtMult_c: colour (rgba), size, size variation, life
+using AddParticleFn = void(__thiscall*)(void*, float*, float*, float, FxMult*, float, float, float, uint32_t);
+struct QueuedPrt {
+    void* sys; float pos[3], vel[3], timeSince; FxMult mult; bool hasMult;
+    float zRot, light, lightLimit; uint32_t local;
+    float due;               // release time in ticks (g_prtTick + share of the tick), given at the first release
+    bool spark, assigned;
+    uint8_t* veh; float rel[3];   // spark on a car: place in the car's frame, put back on the car as shown when released
+};
+AddParticleFn g_origAddParticle = nullptr;   // trampoline (the first 5 bytes of the function, then a jump back)
+bool g_smoothSparks = true, g_inTick = false;
+bool IsSparkSystem(const void* sys) {
+    const uintptr_t v = reinterpret_cast<uintptr_t>(sys);
+    return v && (v == *reinterpret_cast<const uintptr_t*>(0xA9AE28) || v == *reinterpret_cast<const uintptr_t*>(0xA9AE2C));
+}
+bool IsFxCSystem(const void* sys) {
+    const uintptr_t* f = reinterpret_cast<const uintptr_t*>(ADDR_FxC);
+    for (int i = 0; i < FxCSystems; ++i) if (f[i] == reinterpret_cast<uintptr_t>(sys)) return true;
+    return false;
+}
+
+// Fx_c::AddSparks (0x49F040, thiscall pos, dir, force, count, across xyz, blur, spread, life; ret 0x28) is the only
+// user of the spark systems. Its entry is already hooked by another mod, so its 8 call sites are hooked instead.
+// - It spreads the sparks of one call along "across" x step, but that is not always the car's move (scraping, CPhysical
+//   friction at 0x545953, passes another direction): the sparks did not leave from the car as shown. The car is found
+//   instead (nearest vehicle < 8 m), AddSparks gets no "across", and each spark is kept in that car's frame.
+// - CVehicle::AddSingleWheelParticles (0x6DE880, rims on the road) calls it from the vehicles' PreRender (0x6AB136..,
+//   CBike 0x6BD38C, CBmx 0x6C0AFD), which runs on every drawn frame here with the wheel contact of the last tick: 6
+//   times the sparks, piled on one spot. Sparks from PreRender only count on the tick frame (g_inPreRender).
+using AddSparksFn = void(__thiscall*)(void*, float*, float*, float, int, float, float, float, uint32_t, float, float);
+AddSparksFn g_origAddSparks = nullptr;
+constexpr uintptr_t EXPECT_AddSparks = 0x49F040;
+constexpr uintptr_t SITES_AddSparks[] = { 0x475D67, 0x49F498, 0x545953, 0x59E1DB, 0x61D1A9, 0x6A6E8E, 0x6DB6C1, 0x6DEB5A };
+bool g_inSparks = false, g_inPreRender = false;
+uint8_t* g_sparkVeh = nullptr;   // the car the sparks of the current AddSparks call are on
+const uint8_t* VehiclePool(const uint8_t** objs, const int8_t** flags, int* size) {
+    const uint8_t* pool = *reinterpret_cast<uint8_t* const*>(0xB74494);   // CPools::ms_pVehiclePool
+    if (!pool) return nullptr;
+    *objs = *reinterpret_cast<uint8_t* const*>(pool);
+    *flags = *reinterpret_cast<const int8_t* const*>(pool + 4);
+    *size = *reinterpret_cast<const int*>(pool + 8);
+    return pool;
+}
+bool VehicleAlive(const uint8_t* veh) {
+    __try {
+        const uint8_t* objs; const int8_t* flags; int size;
+        if (!veh || !VehiclePool(&objs, &flags, &size)) return false;
+        const intptr_t off = veh - objs;
+        if (off < 0 || off % 0xA18) return false;
+        const int i = int(off / 0xA18);
+        return i < size && flags[i] >= 0 && *reinterpret_cast<uint8_t* const*>(veh + 0x14) != nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+uint8_t* NearestVehicle(const float* pos) {
+    __try {
+        const uint8_t* objs; const int8_t* flags; int size;
+        if (!VehiclePool(&objs, &flags, &size)) return nullptr;
+        float best = 8.0f * 8.0f;
+        const uint8_t* found = nullptr;
+        for (int i = 0; i < size; ++i) {
+            if (flags[i] < 0) continue;   // free slot
+            const uint8_t* v = objs + 0xA18 * i;
+            const uint8_t* m = *reinterpret_cast<uint8_t* const*>(v + 0x14);
+            if (!m) continue;
+            const float* p = reinterpret_cast<const float*>(m + 0x30);
+            const float dx = p[0] - pos[0], dy = p[1] - pos[1], dz = p[2] - pos[2];
+            const float d = dx * dx + dy * dy + dz * dz;
+            if (d < best) { best = d; found = v; }
+        }
+        return const_cast<uint8_t*>(found);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+void __fastcall HookedAddSparks(void* fx, void*, float* pos, float* dir, float force, int count, float ax, float ay, float az,
+                                uint32_t blur, float spread, float life) {
+    const bool was = g_inSparks;
+    g_sparkVeh = (g_smoothSparks && g_logicHz > 0 && pos) ? NearestVehicle(pos) : nullptr;
+    if (g_sparkVeh) ax = ay = az = 0.0f;
+    g_inSparks = true;
+    g_origAddSparks(fx, pos, dir, force, count, ax, ay, az, blur, spread, life);
+    g_inSparks = was;
+}
+
+// The motion streak of a spark (FxPrimBP render 0x4A2C40, mode 2) is its move relative to the camera over one step:
+// (pos - camera now) - (pos - velocity x CTimer::ms_fTimeStep (0x4A30F9) - camera before), "camera before" being
+// TheCamera.m_mCameraMatrixOld's position (0xB6FA14, read at 0x4A318E/9B/A8). Both were per tick: the time step is
+// only a share of it on render-only frames (water, PreRender guard), and the old camera only changed per tick while the
+// shown camera moves every frame, so turning the camera fast stretched every spark more and more until the next tick.
+// Both now cover one drawn frame: g_streakStep, and the camera of the previous drawn frame (g_prevCam).
+float g_streakStep = 50.0f / 30.0f;
+float g_prevCam[3] = {};
+void UpdateStreakStep() {
+    if (g_logicHz <= 0) { g_streakStep = g_tickStep; return; }
+    static LONGLONG last = 0;
+    const LONGLONG now = FrameQpc();
+    double frac = g_fpsCap > 0 ? double(g_logicHz) / double(g_fpsCap) : (last ? double(now - last) / double(g_tickPeriodQpc) : 1.0);
+    last = now;
+    if (frac > 1.0) frac = 1.0;
+    if (frac < 0.0) frac = 0.0;
+    g_streakStep = g_tickStep * float(frac);
+}
+void UpdatePrevCam() {   // at the end of a frame: the camera it was drawn with
+    __try {
+        const uint8_t* cam = *reinterpret_cast<uint8_t* const*>(0xC1703C);        // Scene.m_pRwCamera
+        const uint8_t* frame = cam ? *reinterpret_cast<uint8_t* const*>(cam + 4) : nullptr;
+        if (!frame) return;
+        const float* p = reinterpret_cast<const float*>(frame + 0x10 + 0x30);     // modelling matrix pos, as the render reads
+        for (int k = 0; k < 3; ++k) g_prevCam[k] = p[k];
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+bool RedirectFloat(uintptr_t at, const uint8_t (&expect)[6], float* to) {   // an x87 "op dword ptr [abs]" reads *to instead
+    auto* p = reinterpret_cast<uint8_t*>(at);
+    if (std::memcmp(p, expect, 6) != 0) return false;
+    DWORD old;
+    if (!VirtualProtect(p, 6, PAGE_EXECUTE_READWRITE, &old)) return false;
+    *reinterpret_cast<float**>(p + 2) = to;
+    VirtualProtect(p, 6, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, 6);
+    return true;
+}
+bool PatchSparkStreak() {
+    const uint8_t step[6] = {0xD9, 0x05, 0x5C, 0xCB, 0xB7, 0x00};   // fld dword ptr [0xB7CB5C]
+    const uintptr_t camSites[3] = { 0x4A318E, 0x4A319B, 0x4A31A8 };
+    for (int k = 0; k < 3; ++k) {
+        const uint8_t e[6] = { 0xD8, 0x25, uint8_t(0x14 + 4 * k), 0xFA, 0xB6, 0x00 };   // fsub dword ptr [0xB6FA14 + 4k]
+        if (std::memcmp(reinterpret_cast<void*>(camSites[k]), e, 6) != 0) { Log("spark streak patch: unexpected code, skipped"); return false; }
+    }
+    if (!RedirectFloat(0x4A30F9, step, &g_streakStep)) { Log("spark streak patch: unexpected code, skipped"); return false; }
+    UpdatePrevCam();
+    for (int k = 0; k < 3; ++k) {
+        const uint8_t e[6] = { 0xD8, 0x25, uint8_t(0x14 + 4 * k), 0xFA, 0xB6, 0x00 };
+        RedirectFloat(camSites[k], e, &g_prevCam[k]);
+    }
+    return true;
+}
+
+constexpr int MaxQueuedPrt = 4096;
+QueuedPrt g_prtQueue[MaxQueuedPrt];
+int g_prtCount = 0;
+uint32_t g_prtRand = 0x2545F491u;
+int g_prtTick = 0;            // ticks run so far: release times are g_prtTick + the share of the next tick shown
+float g_sparkSpread = 2.0f;   // ticks over which the sparks of one tick come out
+void __fastcall HookedAddParticle(void* sys, void*, float* pos, float* vel, float timeSince, FxMult* mult,
+                                  float zRot, float light, float lightLimit, uint32_t local) {
+    const bool preRenderSpark = g_inPreRender && IsSparkSystem(sys);
+    if (preRenderSpark && g_renderOnly && g_smoothSparks && g_logicHz > 0) return;   // only once per tick, see g_inPreRender
+    if (!g_smoothSparks || !(g_inTick || preRenderSpark) || g_logicHz <= 0 || g_prtCount >= MaxQueuedPrt || !pos || !vel ||
+        *reinterpret_cast<const uint8_t*>(ADDR_MenuActive) || !IsFxCSystem(sys)) {
+        g_origAddParticle(sys, pos, vel, timeSince, mult, zRot, light, lightLimit, local);
+        return;
+    }
+    QueuedPrt& q = g_prtQueue[g_prtCount++];
+    q.sys = sys;
+    for (int k = 0; k < 3; ++k) { q.pos[k] = pos[k]; q.vel[k] = vel[k]; }
+    q.timeSince = timeSince;
+    q.hasMult = mult != nullptr;
+    if (mult) q.mult = *mult;
+    q.zRot = zRot; q.light = light; q.lightLimit = lightLimit; q.local = local;
+    q.spark = g_inSparks;
+    q.assigned = false;
+    q.due = 0.0f;
+    q.veh = nullptr;
+    if (q.spark && VehicleAlive(g_sparkVeh)) {
+        const float* m = reinterpret_cast<const float*>(*reinterpret_cast<uint8_t* const*>(g_sparkVeh + 0x14));
+        const float d[3] = { pos[0] - m[12], pos[1] - m[13], pos[2] - m[14] };
+        for (int k = 0; k < 3; ++k) q.rel[k] = m[4 * k] * d[0] + m[4 * k + 1] * d[1] + m[4 * k + 2] * d[2];   // right, forward, up
+        q.veh = g_sparkVeh;
+    }
+}
+// Called on every drawn frame after the entities were blended (alpha = share of the next tick shown).
+// - Scraping gives its sparks in lumps (seen in a trace: 8 in one tick, 16 in another, none for 2 ticks): the sparks of
+//   a tick get evenly spaced release times over g_sparkSpread ticks, which also fills the ticks without contact.
+//   Other particles get a random time within the next tick.
+// - timeSince moves a new particle along its way at once (CreateParticle 0x4A2580 runs the update 0x4A21D0 with it).
+//   AddSparks gives (1 - i/count) x 0.05 s, made for a burst of all sparks at once: on top of the delay it made the
+//   first sparks of each tick jump ahead. A spark gets only the time it waited past its release time.
+void ReleaseParticles(float alpha, bool all = false) {
+    if (!g_prtCount || !g_origAddParticle) return;
+    const float a = alpha > 1.0f ? 1.0f : (alpha < 0.0f ? 0.0f : alpha);
+    const float now = float(g_prtTick) + a;
+    const float tickSec = g_logicHz > 0 ? 1.0f / float(g_logicHz) : 0.0f;
+    int newSparks = 0;
+    for (int i = 0; i < g_prtCount; ++i) if (!g_prtQueue[i].assigned && g_prtQueue[i].spark) ++newSparks;
+    int j = 0;
+    for (int i = 0; i < g_prtCount; ++i) {
+        QueuedPrt& q = g_prtQueue[i];
+        if (q.assigned) continue;
+        q.assigned = true;
+        if (q.spark) {
+            q.due = now + (float(j++) + 0.5f) / float(newSparks) * g_sparkSpread;
+        } else {
+            g_prtRand = g_prtRand * 1664525u + 1013904223u;
+            q.due = now + float(g_prtRand >> 8) / 16777216.0f;
+        }
+    }
+    int keep = 0;
+    for (int i = 0; i < g_prtCount; ++i) {
+        QueuedPrt& q = g_prtQueue[i];
+        if (!all && q.due > now) { if (keep != i) g_prtQueue[keep] = q; ++keep; continue; }
+        float pos[3] = { q.pos[0], q.pos[1], q.pos[2] };
+        if (q.veh && VehicleAlive(q.veh)) {
+            const float* m = reinterpret_cast<const float*>(*reinterpret_cast<uint8_t* const*>(q.veh + 0x14));
+            for (int k = 0; k < 3; ++k) pos[k] = m[12 + k] + m[k] * q.rel[0] + m[4 + k] * q.rel[1] + m[8 + k] * q.rel[2];
+        }
+        float late = (now - q.due) * tickSec;
+        if (late < 0.0f) late = 0.0f;
+        const float age = q.spark ? late : q.timeSince + late;
+        g_origAddParticle(q.sys, pos, q.vel, age, q.hasMult ? &q.mult : nullptr, q.zRot, q.light, q.lightLimit, q.local);
+    }
+    g_prtCount = keep;
+}
+bool HookAddParticle() {
+    auto* p = reinterpret_cast<uint8_t*>(ADDR_AddParticle);
+    const uint8_t expect[5] = {0x83, 0xEC, 0x08, 0x56, 0x57};   // sub esp, 8; push esi; push edi
+    if (std::memcmp(p, expect, 5) != 0) { Log("smooth sparks: FxSystem_c::AddParticle already changed by another mod, skipped"); return false; }
+    auto* tramp = static_cast<uint8_t*>(VirtualAlloc(nullptr, 16, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!tramp) return false;
+    std::memcpy(tramp, expect, 5);
+    tramp[5] = 0xE9;
+    *reinterpret_cast<int32_t*>(tramp + 6) = int32_t(ADDR_AddParticle + 5 - reinterpret_cast<uintptr_t>(tramp + 10));
+    FlushInstructionCache(GetCurrentProcess(), tramp, 16);
+    g_origAddParticle = reinterpret_cast<AddParticleFn>(tramp);
+    DWORD old;
+    if (!VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &old)) return false;
+    p[0] = 0xE9;
+    *reinterpret_cast<int32_t*>(p + 1) = int32_t(reinterpret_cast<uintptr_t>(&HookedAddParticle) - (ADDR_AddParticle + 5));
+    VirtualProtect(p, 5, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), p, 5);
+    return true;
+}
+
 constexpr uintptr_t ADDR_LoadRequestedModels = 0x40E3A0, ADDR_GameState = 0xC8D4C0;   // gGameState: 9 = playing
 bool g_streamEveryFrame = true;
 void __cdecl HookedGameProcess() {
@@ -615,7 +904,11 @@ void __cdecl HookedGameProcess() {
     }
     Telemetry::Stamp(Telemetry::M_LogicStart);
     const double t0 = Interp::NowUs();
+    if (!g_smoothSparks) ReleaseParticles(1.0f, true);   // switched off: nothing left waiting
+    g_inTick = true;
     g_origGameProcess();
+    g_inTick = false;
+    ++g_prtTick;
     OnTickSun();
     const double t1 = Interp::NowUs();
     if (g_interpolate) Interp::OnTick();
@@ -653,11 +946,15 @@ void PreRenderBody() {
         *ts = real * TickAlpha();
         Interp::SaveVehicles();
         Interp::SavePeds();
+        g_inPreRender = true;
         g_origPreRender();
+        g_inPreRender = false;
         g_guardPending = true;   // rendering must see PreRender's result; the state is put back at the end of the frame
     } else {
         *ts = real;   // the tick frame advances the state by one full step
+        g_inPreRender = true;
         g_origPreRender();
+        g_inPreRender = false;
     }
     *ts = before;
 }
@@ -673,6 +970,24 @@ bool g_staticFix = true;
 void __cdecl HookedUpdStatic1() { if (g_logicHz > 0 && g_renderOnly && g_staticFix) return; g_origUpdStatic1(); }
 void __cdecl HookedUpdStatic2() { if (g_logicHz > 0 && g_renderOnly && g_staticFix) return; g_origUpdStatic2(); }
 
+// ---- 3D markers (mission cylinders, arrows) -----------------------------------------------------------------
+// Scripts place their markers once per tick (C3dMarkers::PlaceMarker sets "used" + "render this frame"). The markers
+// renderer (0x725040, called at 0x726AE4 every drawn frame) clears both flags after drawing, and frees the markers not
+// placed since: on render-only frames every script marker was freed, then re-created (from size 0) on the next tick,
+// so they were invisible. The flags left by the tick are put back before each render-only frame.
+constexpr uintptr_t SITE_Markers = 0x726AE4, EXPECT_Markers = 0x725040;
+constexpr uintptr_t ADDR_MarkerFlags = 0xC7DD88 + 0x22;   // C3dMarkers::m_aMarkerArray[32], stride 0xA0
+VoidFn g_origMarkers = nullptr;
+uint8_t g_markerFlags[32][2];
+void __cdecl HookedMarkers() {
+    uint8_t* f = reinterpret_cast<uint8_t*>(ADDR_MarkerFlags);
+    for (int k = 0; k < 32; ++k, f += 0xA0) {
+        if (!g_renderOnly) { g_markerFlags[k][0] = f[0]; g_markerFlags[k][1] = f[1]; }
+        else { f[0] |= g_markerFlags[k][0]; f[1] |= g_markerFlags[k][1]; }
+    }
+    g_origMarkers();
+}
+
 // ---- particles and broken-object pieces ---------------------------------------------------------------------
 // CGame::Process advances the effect system (Fx_c::Update, call at 0x53C1F0, dt in seconds) and the pieces of broken
 // objects (BreakManager_c::Update, call at 0x59E670 site 0x53C201, raw timestep) once per tick, so they moved at 30 fps.
@@ -687,8 +1002,11 @@ BreakUpdateFn g_origBreak = nullptr;
 bool g_splitFx = true;
 struct SplitState { void* self = nullptr; void* cam = nullptr; float step = 0; LONGLONG last = 0; bool have = false; };
 SplitState g_fx, g_break;
+// Measured between the times the frames are SHOWN (FrameQpc), not the times of the calls: on tick frames the effects are
+// updated early, in the middle of the simulation, and the time spent there varies (more with many particles), so the
+// real call times made the particles advance by uneven steps.
 float SplitFrac(SplitState& s) {
-    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    LARGE_INTEGER now; now.QuadPart = FrameQpc();
     double f = s.last ? double(now.QuadPart - s.last) / double(g_tickPeriodQpc) : 1.0;
     s.last = now.QuadPart;
     return f < 0.0 ? 0.0f : (f > 1.0 ? 1.0f : float(f));
@@ -705,7 +1023,9 @@ void __fastcall HookedBreak(void* self, void*, float ts) {
 }
 void SplitRenderOnly() {
     if (!g_splitFx) return;
-    if (g_fx.have && g_origFx) g_origFx(g_fx.self, g_fx.cam, g_fx.step * SplitFrac(g_fx));
+    if (g_fx.have && g_origFx) {
+        g_origFx(g_fx.self, g_fx.cam, g_fx.step * SplitFrac(g_fx));
+    }
     if (g_break.have && g_origBreak) {
         // BreakObject_c::Update also counts calls: the object's frame counter (+0xC) goes up and each piece's life
         // (+0x70, pieces of 0x74 bytes at +8, count at +4) goes down by one per call. Extra calls must not age them.
@@ -747,11 +1067,54 @@ void SplitRenderOnly() {
 // tick) and drawn every frame by CStencilShadows::Render. The volumes stayed at the tick position of the cars: 30 Hz
 // shadows. Build them again on every drawn frame, after the cars were blended (the call in Process is kept).
 constexpr uintptr_t ADDR_StencilShadowsProcess = 0x711D90;
+bool g_stencilFrame = true;   // rebuild the stencil volumes on every drawn frame (split from the blob-shadow patch)
+// Bikes and BMX (CVehicle::m_nVehicleType +0x590 == 9) build their shadow volume from CBike::m_mLeanMatrix (+0x5CC),
+// not from their matrix (0x70FB80). It is only recomputed by CBike::CalculateLeanMatrix (0x6B7150) when the flag at
+// +0x5C8 is 0, and the flag is cleared in the bike's PreRender (0x6BD3A1, 0x6C0B12), which runs after this rebuild: the
+// volume used the lean matrix of an earlier frame (put back at the end of the frame by the physics guard), so the
+// shadow jumped between two positions, further apart the faster the bike went (two faint shadows). Clear the flag
+// first: the lean matrix is computed from the blended matrix of this frame. Afterwards the old lean matrix and flag
+// are put back, so the rest of the game sees exactly what it saw before (PreRender recomputes it for drawing anyway).
+struct BikeLean { uint8_t* veh; uint8_t flag; float m[16]; };
+constexpr int MaxBikes = 64;
+BikeLean g_bikeLean[MaxBikes];
+int g_bikeLeanCount = 0;
+void ResetBikeLean() {
+    g_bikeLeanCount = 0;
+    __try {
+        const uint8_t* pool = *reinterpret_cast<uint8_t* const*>(0xB74494);   // CPools::ms_pVehiclePool
+        if (!pool) return;
+        uint8_t* objs = *reinterpret_cast<uint8_t* const*>(pool);
+        const int8_t* flags = *reinterpret_cast<const int8_t* const*>(pool + 4);
+        const int size = *reinterpret_cast<const int*>(pool + 8);
+        for (int i = 0; i < size && g_bikeLeanCount < MaxBikes; ++i) {
+            if (flags[i] < 0) continue;   // free slot
+            uint8_t* v = objs + 0xA18 * i;
+            if (*reinterpret_cast<const int*>(v + 0x590) != 9) continue;
+            BikeLean& b = g_bikeLean[g_bikeLeanCount++];
+            b.veh = v; b.flag = v[0x5C8];
+            std::memcpy(b.m, v + 0x5CC, sizeof(b.m));   // CMatrix right/forward/up/pos (the RwMatrix pointer after it is left alone)
+            v[0x5C8] = 0;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+void RestoreBikeLean() {
+    __try {
+        for (int i = 0; i < g_bikeLeanCount; ++i) {
+            BikeLean& b = g_bikeLean[i];
+            std::memcpy(b.veh + 0x5CC, b.m, sizeof(b.m));
+            b.veh[0x5C8] = b.flag;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    g_bikeLeanCount = 0;
+}
 void UpdateStencilShadows() {
-    if (!g_smoothCarShadows || *reinterpret_cast<const int*>(ADDR_GameState) != 9 || *reinterpret_cast<const uint8_t*>(ADDR_MenuActive)) return;
+    if (!g_stencilFrame || *reinterpret_cast<const int*>(ADDR_GameState) != 9 || *reinterpret_cast<const uint8_t*>(ADDR_MenuActive)) return;
+    ResetBikeLean();
     const uint8_t* camMat = *reinterpret_cast<uint8_t* const*>(0xB6F03C);   // TheCamera.m_matrix (or its placement)
     const float* camPos = camMat ? reinterpret_cast<const float*>(camMat + 0x30) : reinterpret_cast<const float*>(0xB6F02C);
     reinterpret_cast<bool(__cdecl*)(const float*)>(ADDR_StencilShadowsProcess)(camPos);
+    RestoreBikeLean();
 }
 
 // CAudioEngine::Service (0x507750, thiscall on AudioEngine 0xB6BC90) updates every sound entity (each car, ped...) and
@@ -788,6 +1151,8 @@ void __cdecl HookedConstructList() {
     const double t0 = Interp::NowUs();
     if (g_interpolate) Interp::ApplyEntities(TickAlpha());
     if (g_logicHz > 0 && g_renderOnly) SplitRenderOnly();   // after the blend: effects follow the shown entities
+    if (g_logicHz > 0) ReleaseParticles(TickAlpha());   // what the simulation emitted, spread over the drawn frames
+    UpdateStreakStep();
     // the camera too (blended again before RwCameraBeginUpdate): PreRender, shadows and effects see the shown one
     if (g_interpolate) Interp::ApplyCamera(!g_renderOnly, TickAlpha());
     if (g_interpolate && g_logicHz > 0) ApplySun(TickAlpha()); else RestoreSun();
@@ -881,6 +1246,7 @@ HRESULT WINAPI HookedPresent(void* dev, const RECT* src, const RECT* dst, HWND w
     Telemetry::Stamp(Telemetry::M_PresentHook);
     if (g_noFrameLimiter) *reinterpret_cast<volatile uint8_t*>(ADDR_FrameLimiter) = 0;   // the menu or gta_sa.set may turn it on
     FlushGuard();
+    UpdatePrevCam();   // this frame's camera, for the next frame's spark streaks
     ++g_presentCount;
     Telemetry::OnFrame();
     if (g_borderless && g_bwnd) {   // the game restyles its window at times (caption/border): keep it borderless
@@ -978,6 +1344,26 @@ void Init(HMODULE self) {
         HookCall(SITE_UpdStatic1, reinterpret_cast<void*>(&HookedUpdStatic1), reinterpret_cast<void**>(&g_origUpdStatic1), EXPECT_UpdStatic) &&
         HookCall(SITE_UpdStatic2, reinterpret_cast<void*>(&HookedUpdStatic2), reinterpret_cast<void**>(&g_origUpdStatic2), EXPECT_UpdStatic))
         Log("static shadow fix installed (enabled=%d)", int(g_staticFix));
+    if (g_logicHz > 0 && HookCall(SITE_Markers, reinterpret_cast<void*>(&HookedMarkers), reinterpret_cast<void**>(&g_origMarkers), EXPECT_Markers))
+        Log("3D markers fix installed");
+    g_smoothClock = GetPrivateProfileIntW(L"Renewed120", L"SmoothClock", 1, ini) != 0;
+    g_stencilFrame = GetPrivateProfileIntW(L"Renewed120", L"CarStencilEachFrame", 1, ini) != 0;
+    if (g_logicHz > 0 &&
+        HookCall(SITE_RenderWater1, reinterpret_cast<void*>(&HookedRenderWater), reinterpret_cast<void**>(&g_origRenderWater), EXPECT_RenderWater) &&
+        HookCall(SITE_RenderWater2, reinterpret_cast<void*>(&HookedRenderWater), reinterpret_cast<void**>(&g_origRenderWater), EXPECT_RenderWater) &&
+        HookCall(SITE_RenderWater3, reinterpret_cast<void*>(&HookedRenderWater), reinterpret_cast<void**>(&g_origRenderWater), EXPECT_RenderWater))
+        Log("smooth waves installed (enabled=%d)", int(g_smoothClock));
+    if (g_logicHz > 0 && HookCall(SITE_PickupFx, reinterpret_cast<void*>(&HookedPickupFx), reinterpret_cast<void**>(&g_origPickupFx), EXPECT_PickupFx))
+        Log("smooth pickups installed (enabled=%d)", int(g_smoothClock));
+    g_smoothSparks = GetPrivateProfileIntW(L"Renewed120", L"SmoothSparks", 1, ini) != 0;
+    if (g_logicHz > 0 && HookAddParticle()) {
+        Log("smooth sparks/dust emission installed (enabled=%d)", int(g_smoothSparks));
+        int n = 0;
+        for (uintptr_t site : SITES_AddSparks)
+            n += HookCall(site, reinterpret_cast<void*>(&HookedAddSparks), reinterpret_cast<void**>(&g_origAddSparks), EXPECT_AddSparks) ? 1 : 0;
+        Log("spark calls hooked: %d of %d", n, int(sizeof(SITES_AddSparks) / sizeof(SITES_AddSparks[0])));
+    }
+    if (g_logicHz > 0 && PatchSparkStreak()) Log("spark streaks over one drawn frame");
     g_splitFx = GetPrivateProfileIntW(L"Renewed120", L"SmoothFx", 1, ini) != 0;
     if (g_logicHz > 0 &&
         HookCall(SITE_FxUpdate, reinterpret_cast<void*>(&HookedFx), reinterpret_cast<void**>(&g_origFx), EXPECT_FxUpdate) &&
