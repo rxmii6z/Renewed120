@@ -1,6 +1,6 @@
 # Changelog
 
-## v0.5 (not released yet)
+## v0.5
 
 Everything that still moved at 30 fps while the rest of the game runs at your monitor's rate.
 
