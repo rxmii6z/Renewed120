@@ -36,4 +36,6 @@ void RestorePeds();
 void RestoreVehicles();
 // Before the next simulation tick: put the real (latest) state back.
 void Restore();
+// Menu open (a save may be loaded): forget every entity, skeleton and part kept for the blend.
+void Reset();
 }
