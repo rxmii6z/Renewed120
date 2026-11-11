@@ -35,6 +35,7 @@ struct Slot {
     uintptr_t ent = 0;
     uint8_t gen = 0;
     Pose prev{}, curr{};
+    Pose shown{};   // the blended pose last written: anything else found there was put by someone else
 };
 
 constexpr int MaxPed = 512, MaxVeh = 512, MaxObj = 1024;
@@ -82,6 +83,15 @@ bool Teleported(const Pose& a, const Pose& b) {
 }
 
 bool Same(const Pose& a, const Pose& b) { return std::memcmp(&a, &b, sizeof(Pose)) == 0; }
+
+// Another mod (CheatMenu teleport, trainers...) may move an entity between two ticks, from its own drawing hook.
+// The blend then wrote the old place back on the next frame, and the restore before the tick put back the tick's
+// pose: the teleport lasted one frame. A pose that is not the one we wrote (moved > 0.5 m or turned) is taken as
+// the new real state instead.
+bool MovedByOther(const Pose& expected, const Pose& found) {
+    const float d[3] = {found.p[0] - expected.p[0], found.p[1] - expected.p[1], found.p[2] - expected.p[2]};
+    return Dot(d, d) > 0.25f || Dot(expected.a, found.a) < 0.95f || Dot(expected.u, found.u) < 0.95f;
+}
 
 // Entity / camera blend: linear, then re-orthonormalised (right-handed: right x up = at).
 void Blend(const Pose& a, const Pose& b, float t, Pose& o) {
@@ -197,7 +207,14 @@ void QuatToAxes(const Quat& q, float* r, float* u, float* a) {
 // degrees, fast spinning wheels...) or the axes are degenerate: the caller then keeps the real pose.
 bool BlendBone(const Pose& a, const Pose& b, float t, Pose& o) {
     float la[3] = {AxisLen(a.r), AxisLen(a.u), AxisLen(a.a)}, lb[3] = {AxisLen(b.r), AxisLen(b.u), AxisLen(b.a)};
-    for (int i = 0; i < 3; ++i) if (la[i] < 1e-6f || lb[i] < 1e-6f) return false;
+    // a bone shrunk to nothing (the head of a ped shot in the head with a shotgun, for example): it can't be turned
+    // into a rotation, but it is invisible anyway. It takes its current state, only its place is blended, so the
+    // rest of the skeleton keeps blending (before, the whole body fell back to the 30 fps pose).
+    for (int i = 0; i < 3; ++i) if (la[i] < 1e-6f || lb[i] < 1e-6f) {
+        o = b;
+        for (int k = 0; k < 3; ++k) o.p[k] = a.p[k] + (b.p[k] - a.p[k]) * t;
+        return true;
+    }
     float ar[3], au[3], aa[3], br[3], bu[3], ba[3];
     for (int i = 0; i < 3; ++i) {
         ar[i] = a.r[i] / la[0]; au[i] = a.u[i] / la[1]; aa[i] = a.a[i] / la[2];
@@ -312,6 +329,7 @@ void SnapshotPool(uintptr_t poolAddr, uintptr_t stride, Slot* slots, int maxSlot
         s.curr = now;
         if (Teleported(s.prev, s.curr)) s.prev = s.curr;      // teleport / camera cut: snap
         s.ent = ent; s.gen = flag; s.valid = true;
+        s.shown = s.curr;
     }
     for (int i = n; i < maxSlots; ++i) slots[i].valid = false;
 }
@@ -319,9 +337,17 @@ void SnapshotPool(uintptr_t poolAddr, uintptr_t stride, Slot* slots, int maxSlot
 void ApplyPool(Slot* slots, int maxSlots, float alpha) {
     for (int i = 0; i < maxSlots; ++i) {
         Slot& s = slots[i];
-        if (!s.valid || Same(s.prev, s.curr)) continue;
+        if (!s.valid) continue;
+        Pose now{};
+        if (ReadEntityPose(s.ent, now) && MovedByOther(s.shown, now)) {   // moved by another mod: keep it there
+            s.prev = s.curr = s.shown = now;
+            s.applied = false;
+            continue;
+        }
+        if (Same(s.prev, s.curr)) continue;
         Pose p{}; Blend(s.prev, s.curr, alpha, p);
         s.applied = PushPose(s.ent, p);
+        if (s.applied) ReadEntityPose(s.ent, s.shown);
     }
 }
 
@@ -329,8 +355,11 @@ void RestorePool(Slot* slots, int maxSlots) {
     for (int i = 0; i < maxSlots; ++i) {
         Slot& s = slots[i];
         if (!s.applied) continue;
-        PushPose(s.ent, s.curr);
         s.applied = false;
+        Pose now{};
+        if (ReadEntityPose(s.ent, now) && MovedByOther(s.shown, now)) { s.prev = s.curr = s.shown = now; continue; }
+        PushPose(s.ent, s.curr);
+        s.shown = s.curr;
     }
 }
 
@@ -350,7 +379,9 @@ HierSet g_pedHier[MaxPed];
 bool GetHier(uintptr_t ent, void*& hier, uint8_t*& mats, int& n) {
     __try {
         void* clump = *reinterpret_cast<void**>(ent + OFF_EntRwObject);
-        if (!clump) return false;
+        // Only a clump has a skeleton. Most objects are a single atomic: the lookup then walked random memory and
+        // could hand back a "hierarchy" the blend wrote into (heap corruption, crash after loading a save).
+        if (!clump || *static_cast<const uint8_t*>(clump) != 2) return false;   // RwObject::type, rpCLUMP = 2
         hier = reinterpret_cast<void*(__cdecl*)(void*)>(ADDR_GetAnimHierarchyFromSkinClump)(clump);
         if (!hier) return false;
         n = *reinterpret_cast<int*>(static_cast<uint8_t*>(hier) + 4);          // numNodes
@@ -447,7 +478,11 @@ void HierStep(Slot& s, HierSet& h, int pedIdx, bool tickFrame, float alpha) {
 void RestoreHier(HierSet& h, const Slot& s) {
     if (!h.applied) return;
     Pose M, out[MaxHier];
-    if (s.valid && EntityMatrix(s.ent, M)) {
+    // the skeleton may have been rebuilt or freed since it was blended (clothes change, loading a save): only write
+    // into the very same one
+    void* hier = nullptr; uint8_t* mats = nullptr; int n = 0;
+    const bool same = s.valid && GetHier(s.ent, hier, mats, n) && hier == h.hier && mats == h.mats && n == h.n;
+    if (same && EntityMatrix(s.ent, M)) {
         for (int k = 0; k < h.n; ++k) PoseToWorld(M, h.curr[k], out[k]);
         WriteHier(h.mats, h.n, out);
     }
@@ -601,6 +636,16 @@ void SaveMat(uintptr_t ent, uint8_t* dst, uint8_t*& ptr) {
         if (m) { std::memcpy(dst, m, 0x40); ptr = m; }
     } __except (EXCEPTION_EXECUTE_HANDLER) { ptr = nullptr; }
 }
+bool MatMovedByOther(uintptr_t ent, const uint8_t* saved, uint8_t* ptr) {
+    if (!ptr) return false;
+    __try {
+        uint8_t* m = *reinterpret_cast<uint8_t**>(ent + OFF_EntMatrix);
+        if (m != ptr) return false;
+        Pose a{}, b{}; ReadPose(saved, a); ReadPose(m, b);
+        const float d[3] = {b.p[0] - a.p[0], b.p[1] - a.p[1], b.p[2] - a.p[2]};
+        return Dot(d, d) > 1.0f;   // PreRender itself only nudges things (lying peds): this is a teleport
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
 void RestoreMat(uintptr_t ent, const uint8_t* src, uint8_t* ptr) {
     if (!ptr) return;
     __try {
@@ -622,6 +667,7 @@ template <size_t Size>
 void RestoreAll(const Slot* slots, int n, uint8_t (*save)[Size], bool* saved, uint8_t (*mat)[0x40], uint8_t** matPtr) {
     for (int i = 0; i < n; ++i) {
         if (!saved[i]) continue;
+        if (MatMovedByOther(slots[i].ent, mat[i], matPtr[i])) { saved[i] = false; continue; }   // keep what the other mod did
         RestoreMat(slots[i].ent, mat[i], matPtr[i]);
         __try { RestoreScalars(reinterpret_cast<void*>(slots[i].ent), save[i], Size); }
         __except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -646,6 +692,36 @@ bool PedSkeleton() { return g_pedSkeleton; }
 void SetCutsceneSkeleton(bool on) { g_csSkeleton = on; }
 bool CutsceneSkeleton() { return g_csSkeleton; }
 
+// The game can delete entities outside the simulation tick: starting a new game or loading a save rebuilds the
+// whole world from the menu. A slot whose entity is gone must be forgotten before anything is written back: its
+// matrix, skeleton and part frames are freed memory (writing there corrupted the heap and crashed), and a new entity
+// in the same slot must not get the old one's pose (the player stayed where the previous game left them).
+void DropDeadPool(uintptr_t poolAddr, uintptr_t stride, Slot* slots, int maxSlots, HierSet* hier, BoneSet* bones) {
+    PoolView v{};
+    const bool ok = GetPool(poolAddr, v);
+    for (int i = 0; i < maxSlots; ++i) {
+        Slot& s = slots[i];
+        if (!s.valid) continue;
+        bool alive = false;
+        if (ok && i < v.size) {
+            __try { alive = v.flags[i] == s.gen && s.ent == reinterpret_cast<uintptr_t>(v.base) + stride * i; }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        if (alive) continue;
+        s.valid = false; s.applied = false;
+        if (hier) { hier[i].applied = false; hier[i].valid = false; }
+        if (bones) { bones[i].applied = false; bones[i].moved = false; bones[i].n = 0; }
+    }
+}
+void DropDead() {
+    DropDeadPool(ADDR_PedPool, STRIDE_Ped, g_ped, MaxPed, g_pedHier, nullptr);
+    DropDeadPool(ADDR_VehPool, STRIDE_Veh, g_veh, MaxVeh, nullptr, g_vehBones);
+    DropDeadPool(ADDR_ObjPool, STRIDE_Obj, g_obj, MaxObj, nullptr, nullptr);
+    for (auto& c : g_cs) {
+        if (c.used && !g_obj[c.slot].valid) { c.used = false; c.h.applied = false; c.b.applied = false; }
+    }
+}
+
 void OnTick() {
     g_camNeedCapture = true;
     SnapshotPool(ADDR_PedPool, STRIDE_Ped, g_ped, MaxPed);
@@ -654,12 +730,14 @@ void OnTick() {
 }
 
 void ApplyEntities(float alpha) {
+    DropDead();
     ApplyPool(g_ped, MaxPed, alpha);
     ApplyPool(g_veh, MaxVeh, alpha);
     ApplyPool(g_obj, MaxObj, alpha);
 }
 
 void ApplyHierarchies(bool tickFrame, float alpha) {
+    DropDead();
     UpdateVehicleParts(tickFrame, alpha);
     UpdatePedHierarchies(tickFrame, alpha);
     UpdateCutscene(tickFrame, alpha);
@@ -669,6 +747,7 @@ void ApplyHierarchies(bool tickFrame, float alpha) {
 // The ped frames as they are right before PreRender (see g_pedPre). On render-only frames a frame that a previous
 // PreRender moved is put back first, so it does not drift further.
 void CapturePedFrames(bool tickFrame) {
+    DropDead();
     for (int i = 0; i < MaxPed; ++i) {
         g_pedPreOk[i] = g_ped[i].valid && ReadEntityPose(g_ped[i].ent, g_pedPre[i]);
         if (!g_pedPreOk[i] || tickFrame) continue;
@@ -712,7 +791,19 @@ void RestorePeds() { RestoreAll<STRIDE_Ped>(g_ped, MaxPed, g_pedSave, g_pedSaved
 void SaveVehicles() { SaveAll<STRIDE_Veh>(g_veh, MaxVeh, g_vehSave, g_vehSaved, g_vehMat, g_vehMatPtr); }
 void RestoreVehicles() { RestoreAll<STRIDE_Veh>(g_veh, MaxVeh, g_vehSave, g_vehSaved, g_vehMat, g_vehMatPtr); }
 
+// Loading a save (or starting a new game) from the menu frees and rebuilds every entity, skeleton and part frame,
+// and the pools come back from the save with the same slot markers: nothing kept from before can be trusted. While
+// the menu is open the world is not simulated nor blended, so all blend state is simply forgotten.
+void Reset() {
+    for (int i = 0; i < MaxPed; ++i) { g_ped[i].valid = g_ped[i].applied = false; g_pedHier[i].valid = g_pedHier[i].applied = false; g_pedSaved[i] = false; g_pedPreOk[i] = false; }
+    for (int i = 0; i < MaxVeh; ++i) { g_veh[i].valid = g_veh[i].applied = false; g_vehBones[i].n = 0; g_vehBones[i].moved = g_vehBones[i].applied = false; g_vehSaved[i] = false; g_vehPartsEnt[i] = 0; }
+    for (int i = 0; i < MaxObj; ++i) g_obj[i].valid = g_obj[i].applied = false;
+    ClearCutscene();
+    g_cam.valid = g_cam.applied = false;
+}
+
 void Restore() {
+    DropDead();
     RestorePool(g_ped, MaxPed);
     for (int i = 0; i < MaxPed; ++i) RestoreHier(g_pedHier[i], g_ped[i]);
     for (auto& b : g_vehBones) RestoreBones(b);
@@ -727,3 +818,4 @@ void Restore() {
 }
 
 }  // namespace Interp
+

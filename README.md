@@ -34,6 +34,8 @@ frame rate (as high as your monitor) without breaking the game.
 - headlight patches of AI cars on the ground recomputed every frame (`SmoothCarLights`)
 - car shadows follow the cars on every frame: simple shadows at low visual FX (`SmoothCarShadows`), shadow volumes of cars, bikes and BMX at medium and above (`CarStencilEachFrame`)
 - sea waves and the spin of weapons/pickups on the ground follow the drawn frames (`SmoothClock`)
+- moving fog drifts at the game's speed whatever the frame rate (`SmoothFog`)
+- also smooth on every frame: camera zoom, mirrors, the sky, birds, helicopter searchlights, broken glass, fire truck water jets, props held by peds
 - sparks, wheel dust and debris come out as a steady stream that follows the car, not as one burst per simulation step; spark streaks no longer stretch when the camera turns (`SmoothSparks`)
 - the sun and the shadows it casts move smoothly as the time of day passes (`SmoothSun`)
 - map models and LODs loaded from disk as fast as in the original game (`StreamEveryFrame`)

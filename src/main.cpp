@@ -9,6 +9,7 @@
 //
 // Minimal D3D9 declarations are repeated here on purpose: no DirectX SDK is needed.
 #include <windows.h>
+#include <intrin.h>
 #include <cstring>
 #include <cstdio>
 #include <cstdarg>
@@ -272,6 +273,13 @@ void RestoreWaterTiming() {
     g_waterSaved = false;
 }
 
+// The +1 above must only be seen by the water code: the HUD is hidden for one frame by stamping the frame counter
+// (0xB6EC40 == counter, idle camera, cutscenes...), so a counter left at +1 showed the HUD on the drawn frames of
+// one tick every 32 (a flicker every second). Called right after the water function returns.
+void RestoreWaterCounter() {
+    if (g_waterSaved) *reinterpret_cast<uint32_t*>(ADDR_FrameCtrW) = g_savedCtr;
+}
+
 char __cdecl HookedWaterGate() {
     if (g_logicHz > 0) {
         LARGE_INTEGER now; now.QuadPart = FrameQpc();   // shown time of this frame, see SplitFrac
@@ -299,6 +307,7 @@ char __cdecl HookedWaterGate() {
 // stores the shifted value: they only read it), then put back.
 constexpr uintptr_t ADDR_TimeMs = 0xB7CB84;
 bool     g_smoothClock = true;
+bool     g_smoothFog = true;     // see HookedMovingFog
 uint32_t g_tickMs = 0, g_lastTickTimeMs = 0;   // game ms the last tick advanced the clock by
 uint32_t ClockAheadMs() {
     if (!g_smoothClock || g_logicHz <= 0 || !g_renderOnly || *reinterpret_cast<const uint8_t*>(ADDR_MenuActive)) return 0;
@@ -313,14 +322,26 @@ struct ClockShift {
     }
     ~ClockShift() { if (on) *reinterpret_cast<volatile uint32_t*>(ADDR_TimeMs) = saved; }
 };
-// CWaterLevel::RenderWater (0x6EF650, called at the three sites below) and the pickups' spin / glow (0x4560E0, called
-// from the object pre-render at 0x536961 with the object).
+// CWaterLevel::RenderWater (0x6EF650, called at the three sites below) and the pickups' spin / glow, both called from
+// CObject's pre-render with the object: 0x455720 for every usual pickup (weapons, health, armour, money...) at
+// 0x536541, 0x4560E0 for a few special models at 0x536961.
 constexpr uintptr_t SITE_RenderWater1 = 0x53DD31, SITE_RenderWater2 = 0x53E004, SITE_RenderWater3 = 0x53E142, EXPECT_RenderWater = 0x6EF650;
-constexpr uintptr_t SITE_PickupFx = 0x536961, EXPECT_PickupFx = 0x4560E0;
+constexpr uintptr_t SITE_PickupFx = 0x536541, EXPECT_PickupFx = 0x455720;
+constexpr uintptr_t SITE_PickupFx2 = 0x536961, EXPECT_PickupFx2 = 0x4560E0;
 VoidFn g_origRenderWater = nullptr;
 void (__cdecl* g_origPickupFx)(void*) = nullptr;
+void (__cdecl* g_origPickupFx2)(void*) = nullptr;
 void __cdecl HookedRenderWater() { ClockShift shift; g_origRenderWater(); }
 void __cdecl HookedPickupFx(void* ent) { ClockShift shift; g_origPickupFx(ent); }
+void __cdecl HookedPickupFx2(void* ent) { ClockShift shift; g_origPickupFx2(ent); }
+// Money dropped by peds (0x454E80, at 0x5361BE) and collectables: tags, horseshoes, oysters, snapshots (0x455E20, at
+// 0x536187) are turned by the same pre-render from the game clock, which only moves on ticks.
+constexpr uintptr_t SITE_MoneyFx = 0x5361BE, EXPECT_MoneyFx = 0x454E80;
+constexpr uintptr_t SITE_CollectFx = 0x536187, EXPECT_CollectFx = 0x455E20;
+void (__cdecl* g_origMoneyFx)(void*) = nullptr;
+void (__cdecl* g_origCollectFx)(void*) = nullptr;
+void __cdecl HookedMoneyFx(void* ent) { ClockShift shift; g_origMoneyFx(ent); }
+void __cdecl HookedCollectFx(void* ent) { ClockShift shift; g_origCollectFx(ent); }
 
 // ---- car headlight patches on the ground ------------------------------------------------------------------
 // CShadows::StoreCarLightShadow picks the headlight patch of AI cars from "speed x ms_fTimeStep" (fmul at 0x70C679).
@@ -428,7 +449,7 @@ void SaveIni() {
     put(L"Interpolate", g_interpolate); put(L"VehicleParts", Interp::VehicleParts()); put(L"PedSkeleton", Interp::PedSkeleton());
     put(L"CutsceneSkeleton", Interp::CutsceneSkeleton()); put(L"WaterFix", g_waterRedo); put(L"StaticShadowFix", g_staticFix);
     put(L"SmoothFx", g_splitFx); put(L"StreamEveryFrame", g_streamEveryFrame); put(L"VehicleGuard", g_freezeVeh); put(L"SmoothSun", g_smoothSun); put(L"SmoothCarShadows", g_smoothCarShadows);
-    put(L"SmoothClock", g_smoothClock); put(L"CarStencilEachFrame", g_stencilFrame); put(L"SmoothSparks", g_smoothSparks);
+    put(L"SmoothClock", g_smoothClock); put(L"SmoothFog", g_smoothFog); put(L"CarStencilEachFrame", g_stencilFrame); put(L"SmoothSparks", g_smoothSparks);
     put(L"FpsCap", g_fpsCapSetting); put(L"LogicHz", g_logicHz);
 }
 
@@ -546,6 +567,8 @@ void __cdecl HookedRender2d() {
 
 void FlushGuard();
 void RestoreSun();
+void RestoreFov();
+void RestoreTheCamera();
 void __cdecl HookedTimerUpdate() {
     static LARGE_INTEGER freq, nextTick;
     if (g_logicHz <= 0) { g_origTimerUpdate(); return; }   // split disabled after a partial hook failure
@@ -572,7 +595,10 @@ void __cdecl HookedTimerUpdate() {
         RestoreWaterTiming();
         FlushGuard();
         Interp::Restore();   // the simulation must see the real, latest state
+        if (menu) Interp::Reset();   // a save may be loaded from the menu: see Interp::Reset
         RestoreSun();
+        RestoreFov();
+        RestoreTheCamera();
         const double t1 = Interp::NowUs();
         g_lastTickQpc = sched;   // on the fixed schedule: blend steps stay even
         g_tickPeriodQpc = period;
@@ -907,6 +933,7 @@ void __cdecl HookedGameProcess() {
     if (!g_smoothSparks) ReleaseParticles(1.0f, true);   // switched off: nothing left waiting
     g_inTick = true;
     g_origGameProcess();
+    RestoreWaterCounter();   // CGame::Process ends with a jump to the water function
     g_inTick = false;
     ++g_prtTick;
     OnTickSun();
@@ -935,7 +962,53 @@ void __cdecl HookedPreRender() {
     PreRenderBody();
     Telemetry::Stamp(Telemetry::M_PreEnd);
 }
+// Police helicopter searchlights: CHeli::PreRender (vtable 0x8716C4) adds its light to a list (count 0xC1C96C) that
+// is drawn every frame, but only CHeli::UpdateHelis, in the tick, empties it. Every drawn frame between two ticks
+// added one more copy at another place (until the list was full): flicker and jerks. Emptied before each PreRender,
+// the list holds exactly this frame's lights.
+constexpr uintptr_t ADDR_NumHeliSearchLights = 0xC1C96C;
+// The beam goes from the (blended) helicopter to the point it searches, CHeli +0x9F4 (x, y, z), which the tick moves:
+// the beam swept at 30 fps. Around PreRender that point is blended between its last two tick values.
+constexpr uintptr_t VT_Heli = 0x871680;
+constexpr int OFF_HeliTarget = 0x9F4, MaxHeliSlots = 256;
+struct HeliTarget { const uint8_t* veh; float prev[3], curr[3], real[3]; bool set; };
+HeliTarget g_heliTgt[MaxHeliSlots];
+unsigned g_heliTick = ~0u;
+void BlendHeliTargets() {
+    const uint8_t* objs; const int8_t* flags; int size;
+    if (!g_interpolate || !VehiclePool(&objs, &flags, &size)) return;
+    if (size > MaxHeliSlots) size = MaxHeliSlots;
+    const bool newTick = g_heliTick != g_ticks;
+    g_heliTick = g_ticks;
+    const float t = TickAlpha();
+    for (int i = 0; i < size; ++i) {
+        HeliTarget& h = g_heliTgt[i];
+        h.set = false;
+        uint8_t* v = const_cast<uint8_t*>(objs) + 0xA18 * i;
+        if (flags[i] < 0 || *reinterpret_cast<const uintptr_t*>(v) != VT_Heli) { h.veh = nullptr; continue; }
+        float* tg = reinterpret_cast<float*>(v + OFF_HeliTarget);
+        if (newTick) {
+            const float d[3] = {tg[0] - h.curr[0], tg[1] - h.curr[1], tg[2] - h.curr[2]};
+            const bool fresh = h.veh != v || d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > 400.0f;
+            std::memcpy(h.prev, fresh ? tg : h.curr, 12);
+            std::memcpy(h.curr, tg, 12);
+            h.veh = v;
+        }
+        if (h.veh != v) continue;
+        std::memcpy(h.real, tg, 12);
+        for (int k = 0; k < 3; ++k) tg[k] = h.prev[k] + (h.curr[k] - h.prev[k]) * t;
+        h.set = true;
+    }
+}
+void RestoreHeliTargets() {
+    for (auto& h : g_heliTgt) {
+        if (!h.set) continue;
+        std::memcpy(const_cast<uint8_t*>(h.veh) + OFF_HeliTarget, h.real, 12);
+        h.set = false;
+    }
+}
 void PreRenderBody() {
+    if (g_logicHz > 0) *reinterpret_cast<int*>(ADDR_NumHeliSearchLights) = 0;
     if (g_interpolate) Interp::CapturePedFrames(!g_renderOnly);
     if (g_logicHz <= 0 || !g_freezeVeh) { g_origPreRender(); return; }
     float* ts = reinterpret_cast<float*>(ADDR_TimeStepF);
@@ -946,15 +1019,19 @@ void PreRenderBody() {
         *ts = real * TickAlpha();
         Interp::SaveVehicles();
         Interp::SavePeds();
+        BlendHeliTargets();
         g_inPreRender = true;
         g_origPreRender();
         g_inPreRender = false;
+        RestoreHeliTargets();
         g_guardPending = true;   // rendering must see PreRender's result; the state is put back at the end of the frame
     } else {
         *ts = real;   // the tick frame advances the state by one full step
+        BlendHeliTargets();
         g_inPreRender = true;
         g_origPreRender();
         g_inPreRender = false;
+        RestoreHeliTargets();
     }
     *ts = before;
 }
@@ -1143,11 +1220,387 @@ void __fastcall HookedAudio(void* self, void* edx) {
 }
 int __cdecl HookedRwBegin(void* p) { const int r = g_origRwBegin(p); Telemetry::Stamp(Telemetry::M_RwBeginEnd); return r; }
 
+// ---- birds ----------------------------------------------------------------------------------------------------
+// CBirds::Update (in the tick) moves the 6 birds (array 0xC6A8B0, stride 0x44: position +0, heading +0x1C, in use
+// +0x37); CBirds::Render (0x712810, called at 0x53DE1C and 0x53E170) draws them where the last tick left them and
+// flaps their wings from the game clock. Around the render they are put at the blend of their last two tick states
+// and the clock is moved ahead like for the waves.
+constexpr uintptr_t SITE_Birds1 = 0x53DE1C, SITE_Birds2 = 0x53E170, EXPECT_Birds = 0x712810, ADDR_Birds = 0xC6A8B0;
+constexpr int NumBirds = 6, BirdStride = 0x44;
+VoidFn g_origBirds1 = nullptr, g_origBirds2 = nullptr;
+struct BirdState { float p[3]; float h; bool used; };
+BirdState g_birdPrev[NumBirds], g_birdCurr[NumBirds];
+unsigned g_birdTick = ~0u;
+uint8_t* Bird(int i) { return reinterpret_cast<uint8_t*>(ADDR_Birds + BirdStride * i); }
+void ReadBird(int i, BirdState& b) {
+    std::memcpy(b.p, Bird(i), 12);
+    b.h = *reinterpret_cast<const float*>(Bird(i) + 0x1C);
+    b.used = Bird(i)[0x37] != 0;
+}
+void RenderBirds(VoidFn orig) {
+    if (!g_interpolate || g_logicHz <= 0) { orig(); return; }
+    if (g_birdTick != g_ticks) {   // first draw after a tick: the array holds the new tick's state
+        const bool first = g_birdTick == ~0u;
+        g_birdTick = g_ticks;
+        for (int i = 0; i < NumBirds; ++i) {
+            BirdState now; ReadBird(i, now);
+            const float d[3] = {now.p[0] - g_birdCurr[i].p[0], now.p[1] - g_birdCurr[i].p[1], now.p[2] - g_birdCurr[i].p[2]};
+            const bool fresh = first || !g_birdCurr[i].used || !now.used || d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > 100.0f;
+            g_birdPrev[i] = fresh ? now : g_birdCurr[i];
+            g_birdCurr[i] = now;
+        }
+    }
+    const float t = TickAlpha();
+    BirdState saved[NumBirds];
+    for (int i = 0; i < NumBirds; ++i) {
+        ReadBird(i, saved[i]);
+        const BirdState& a = g_birdPrev[i]; const BirdState& b = g_birdCurr[i];
+        if (!saved[i].used || !b.used) continue;
+        float* pos = reinterpret_cast<float*>(Bird(i));
+        for (int k = 0; k < 3; ++k) pos[k] = a.p[k] + (b.p[k] - a.p[k]) * t;
+        float dh = b.h - a.h;
+        while (dh > 3.14159265f) dh -= 6.2831853f;
+        while (dh < -3.14159265f) dh += 6.2831853f;
+        *reinterpret_cast<float*>(Bird(i) + 0x1C) = a.h + dh * t;
+    }
+    { ClockShift shift; orig(); }
+    for (int i = 0; i < NumBirds; ++i) {
+        if (!saved[i].used) continue;
+        std::memcpy(Bird(i), saved[i].p, 12);
+        *reinterpret_cast<float*>(Bird(i) + 0x1C) = saved[i].h;
+    }
+}
+void __cdecl HookedBirds1() { RenderBirds(g_origBirds1); }
+void __cdecl HookedBirds2() { RenderBirds(g_origBirds2); }
+
+// ---- broken glass ---------------------------------------------------------------------------------------------
+// The falling pieces of broken windscreens and windows (CFallingGlassPane, 45 at 0xC71BF8, stride 0x70: CMatrix at
+// +0, in use +0x6D) are moved and spun by CGlass::Update in the tick and drawn by CGlass::Render (0x71CE20, called
+// at 0x53DE21 and 0x53E17F) on every frame. Around the render each piece is put at the blend of its last two ticks.
+constexpr uintptr_t SITE_Glass1 = 0x53DE21, SITE_Glass2 = 0x53E17F, EXPECT_Glass = 0x71CE20, ADDR_Panes = 0xC71BF8;
+constexpr int NumPanes = 45, PaneStride = 0x70;
+VoidFn g_origGlass1 = nullptr, g_origGlass2 = nullptr;
+struct PaneState { float m[16]; bool used; };
+PaneState g_panePrev[NumPanes], g_paneCurr[NumPanes];
+unsigned g_paneTick = ~0u;
+float* Pane(int i) { return reinterpret_cast<float*>(ADDR_Panes + PaneStride * i); }
+bool PaneUsed(int i) { return reinterpret_cast<const uint8_t*>(Pane(i))[0x6D] != 0; }
+void BlendAxis(const float* a, const float* b, float t, float* o) {
+    const float la = std::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]), lb = std::sqrt(b[0] * b[0] + b[1] * b[1] + b[2] * b[2]);
+    for (int k = 0; k < 3; ++k) o[k] = a[k] + (b[k] - a[k]) * t;
+    const float l = std::sqrt(o[0] * o[0] + o[1] * o[1] + o[2] * o[2]);
+    if (l > 1e-6f) { const float want = la + (lb - la) * t; for (int k = 0; k < 3; ++k) o[k] *= want / l; }
+}
+void RenderGlass(VoidFn orig) {
+    if (!g_interpolate || g_logicHz <= 0) { orig(); return; }
+    if (g_paneTick != g_ticks) {
+        g_paneTick = g_ticks;
+        for (int i = 0; i < NumPanes; ++i) {
+            PaneState now; std::memcpy(now.m, Pane(i), sizeof now.m); now.used = PaneUsed(i);
+            const float* c = g_paneCurr[i].m;
+            const float d[3] = {now.m[12] - c[12], now.m[13] - c[13], now.m[14] - c[14]};
+            const bool fresh = !g_paneCurr[i].used || !now.used || d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > 25.0f;
+            g_panePrev[i] = fresh ? now : g_paneCurr[i];
+            g_paneCurr[i] = now;
+        }
+    }
+    const float t = TickAlpha();
+    float saved[NumPanes][16]; bool set[NumPanes];
+    for (int i = 0; i < NumPanes; ++i) {
+        set[i] = PaneUsed(i) && g_paneCurr[i].used;
+        if (!set[i]) continue;
+        float* m = Pane(i);
+        std::memcpy(saved[i], m, sizeof saved[i]);
+        const float* a = g_panePrev[i].m; const float* b = g_paneCurr[i].m;
+        for (int r = 0; r < 3; ++r) BlendAxis(a + r * 4, b + r * 4, t, m + r * 4);
+        for (int k = 0; k < 3; ++k) m[12 + k] = a[12 + k] + (b[12 + k] - a[12 + k]) * t;
+    }
+    orig();
+    for (int i = 0; i < NumPanes; ++i) if (set[i]) std::memcpy(Pane(i), saved[i], sizeof saved[i]);
+}
+void __cdecl HookedGlass1() { RenderGlass(g_origGlass1); }
+void __cdecl HookedGlass2() { RenderGlass(g_origGlass2); }
+
+// ---- water cannons (fire truck, SWAT tank) ----------------------------------------------------------------------
+// CWaterCannon (3 at 0xC80740, stride 0x3CC, in use if +0 != 0): 32 points of the jet at +0x0C, their speeds at
+// +0x18C, point alive at +0x30C, newest point at +4. On each tick the oldest point is freed, every point does
+// speed.z -= g * step then point += speed * step, and a new point is added at the nozzle. CWaterCannons::Render
+// (0x729B30, called at 0x53DE26 and 0x53E1A5) draws the jet on every frame as three ribbons through the points: one
+// turned to the camera, two in random directions, wider and more faded toward the end. Around it:
+//   - each point is put at the blend, point - speed * step * (1 - alpha); the newest one follows the nozzle and the
+//     oldest one slides onto the next point, so the jet neither stretches nor snaps back at each tick;
+//   - the camera matrix is blended (the first ribbon is turned to it);
+//   - the width and fade of a segment use its place along the jet plus alpha instead of a whole number (cave);
+//   - the two random directions are picked once per tick instead of on every frame (rand hook);
+//   - segments up to 10 m are drawn instead of 5 m: on a moving truck they are near that length and the blend made
+//     them appear and disappear from frame to frame.
+constexpr uintptr_t SITE_Cannons1 = 0x53DE26, SITE_Cannons2 = 0x53E1A5, EXPECT_Cannons = 0x729B30, ADDR_Cannons = 0xC80740;
+constexpr int NumCannons = 3, CannonStride = 0x3CC, CannonPoints = 32;
+VoidFn g_origCannons1 = nullptr, g_origCannons2 = nullptr;
+bool BeginCamMatrixBlend();
+void EndCamMatrixBlend();
+
+// Segment j (from the nozzle, [esp+0x2C]) gets the width j*j/32 + 3 and the alpha 64 * (1 - j/32). The cave at
+// 0x7290C2 uses j + alpha: just before a tick that is j + 1, just after it the same segment is j + 1 + 0.
+constexpr uintptr_t SITE_CannonFade = 0x7290C2, SITE_CannonMaxSeg = 0x728F04;
+float g_cannonSegOff = 0.0f;
+float g_cannonMaxSeg2 = 100.0f;   // squared length; the game uses 25 (0x858FE8)
+__declspec(naked) void CannonFadeCave() {
+    __asm {
+        movsx eax, word ptr [esp + 0x2C]
+        mov [esp + 0x18], eax
+        mov ecx, eax
+        imul ecx, eax
+        mov [esp + 0x10], ecx
+        fild dword ptr [esp + 0x18]
+        fadd dword ptr [g_cannonSegOff]
+        fld st(0)
+        fmul st(0), st(0)
+        fmul dword ptr ds:[0x864E10]      ; 1/32
+        fadd dword ptr ds:[0x858B3C]      ; 3
+        fxch st(1)
+        fmul dword ptr ds:[0x864E10]
+        fmul dword ptr ds:[0x859A44]      ; 64
+        fsubr dword ptr ds:[0x859A44]
+        push 0x7290FA
+        ret
+    }
+}
+bool PatchCannonRender() {
+    uint8_t* fade = reinterpret_cast<uint8_t*>(SITE_CannonFade);
+    uint8_t* maxSeg = reinterpret_cast<uint8_t*>(SITE_CannonMaxSeg);
+    static const uint8_t expectFade[] = {0x0F, 0xBF, 0x44, 0x24, 0x2C, 0x8B, 0xC8, 0x0F, 0xAF, 0xC8};
+    static const uint8_t expectMaxSeg[] = {0xD8, 0x1D, 0xE8, 0x8F, 0x85, 0x00};
+    if (std::memcmp(fade, expectFade, sizeof expectFade) != 0 || std::memcmp(maxSeg, expectMaxSeg, sizeof expectMaxSeg) != 0)
+        return false;
+    DWORD old;
+    if (!VirtualProtect(fade, 5, PAGE_EXECUTE_READWRITE, &old)) return false;
+    fade[0] = 0xE9;
+    *reinterpret_cast<int32_t*>(fade + 1) = int32_t(reinterpret_cast<uintptr_t>(&CannonFadeCave) - (SITE_CannonFade + 5));
+    VirtualProtect(fade, 5, old, &old);
+    if (!VirtualProtect(maxSeg, 6, PAGE_EXECUTE_READWRITE, &old)) return false;
+    *reinterpret_cast<float**>(maxSeg + 2) = &g_cannonMaxSeg2;
+    VirtualProtect(maxSeg, 6, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), nullptr, 0);
+    return true;
+}
+
+// The two random directions: six rand() calls of the first drawn segment. CWaterCannon* is at [esp+0x30] of the
+// caller (stored at 0x728DB5).
+constexpr uintptr_t SITE_CannonRand[6] = {0x728FD2, 0x728FE9, 0x729000, 0x72904A, 0x729061, 0x729078};
+constexpr uintptr_t EXPECT_Rand = 0x821B1E;
+using RandFn = int(__cdecl*)();
+RandFn g_origCannonRand = nullptr;
+bool g_cannonRandOn = false;
+int g_cannonRand[NumCannons][6];
+unsigned g_cannonRandSeed = 0x2545F491u;
+int CannonRandNext() {
+    g_cannonRandSeed = g_cannonRandSeed * 214013u + 2531011u;
+    return int((g_cannonRandSeed >> 16) & 0x7FFF);
+}
+int __cdecl HookedCannonRand() {
+    if (!g_cannonRandOn) return g_origCannonRand();
+    const uintptr_t site = reinterpret_cast<uintptr_t>(_ReturnAddress()) - 5;
+    int k = 0;
+    while (k < 6 && SITE_CannonRand[k] != site) ++k;
+    const uintptr_t frame = reinterpret_cast<uintptr_t>(_AddressOfReturnAddress()) + 4;
+    const int c = int((*reinterpret_cast<const uintptr_t*>(frame + 0x30) - ADDR_Cannons) / CannonStride);
+    if (k >= 6 || c < 0 || c >= NumCannons) return g_origCannonRand();
+    return g_cannonRand[c][k];
+}
+bool HookCannonRand() {
+    for (uintptr_t site : SITE_CannonRand)
+        if (!HookCall(site, reinterpret_cast<void*>(&HookedCannonRand), reinterpret_cast<void**>(&g_origCannonRand), EXPECT_Rand))
+            return false;
+    return true;
+}
+
+void RenderCannons(VoidFn orig) {
+    if (!g_interpolate || g_logicHz <= 0 || g_tickStep <= 0.0f) { orig(); return; }
+    static float saved[NumCannons][CannonPoints][3];
+    static float emitPrev[NumCannons][3], emitCurr[NumCannons][3];   // nozzle at the last two ticks
+    static int lastCur[NumCannons];
+    static bool emitOk[NumCannons];
+    static unsigned cannonTick = ~0u;
+    const bool newTick = cannonTick != g_ticks;
+    cannonTick = g_ticks;
+    const float alpha = TickAlpha(), back = g_tickStep * (1.0f - alpha);
+    for (int c = 0; c < NumCannons; ++c) {
+        uint8_t* w = reinterpret_cast<uint8_t*>(ADDR_Cannons + CannonStride * c);
+        if (!*reinterpret_cast<const int*>(w)) { emitOk[c] = false; continue; }
+        float* pts = reinterpret_cast<float*>(w + 0x0C);
+        const float* spd = reinterpret_cast<const float*>(w + 0x18C);
+        const uint8_t* alive = w + 0x30C;
+        const int cur = *reinterpret_cast<const int16_t*>(w + 4) & 31;
+        if (newTick) {
+            for (int k = 0; k < 6; ++k) g_cannonRand[c][k] = CannonRandNext();
+            const bool added = emitOk[c] && cur != lastCur[c] && alive[cur];
+            std::memcpy(emitPrev[c], added ? emitCurr[c] : pts + cur * 3, 12);
+            std::memcpy(emitCurr[c], pts + cur * 3, 12);
+            emitOk[c] = alive[cur] != 0;
+            lastCur[c] = cur;
+        }
+        std::memcpy(saved[c], pts, sizeof saved[c]);
+        for (int i = 0; i < CannonPoints; ++i) {
+            if (!alive[i]) continue;
+            float* p = pts + i * 3;
+            if (i == cur && emitOk[c])
+                for (int k = 0; k < 3; ++k) p[k] = emitPrev[c][k] + (emitCurr[c][k] - emitPrev[c][k]) * alpha;
+            else
+                for (int k = 0; k < 3; ++k) p[k] -= spd[i * 3 + k] * back;
+        }
+        if (emitOk[c]) {   // the oldest point (o) slides onto the next one (n): it is freed at the next tick
+            int o = -1, n = -1;
+            for (int k = 1; k < CannonPoints && n < 0; ++k) {
+                const int i = (cur + k) & 31;
+                if (!alive[i]) continue;
+                if (o < 0) o = i; else n = i;
+            }
+            if (o >= 0 && n >= 0 && n != cur)
+                for (int k = 0; k < 3; ++k) pts[o * 3 + k] += (pts[n * 3 + k] - pts[o * 3 + k]) * alpha;
+        }
+    }
+    const bool cam = BeginCamMatrixBlend();
+    g_cannonSegOff = alpha;
+    g_cannonRandOn = true;
+    orig();
+    g_cannonRandOn = false;
+    g_cannonSegOff = 0.0f;
+    if (cam) EndCamMatrixBlend();
+    for (int c = 0; c < NumCannons; ++c) {
+        uint8_t* w = reinterpret_cast<uint8_t*>(ADDR_Cannons + CannonStride * c);
+        if (*reinterpret_cast<const int*>(w)) std::memcpy(w + 0x0C, saved[c], sizeof saved[c]);
+    }
+}
+void __cdecl HookedCannons1() { RenderCannons(g_origCannons1); }
+void __cdecl HookedCannons2() { RenderCannons(g_origCannons2); }
+
+// ---- moving fog -------------------------------------------------------------------------------------------------
+// CClouds::MovingFogRender (0x716C90, called on every drawn frame at 0x53E1AF) moves each fog patch by the fog wind
+// vector (0xC6E388, a constant set once in CClouds::Init) times its own speed, once per call and not per unit of
+// time: drawn at 300 fps the fog flew 10 times too fast. Around the call the wind is scaled by the share of a tick
+// this frame stands for (ms_fTimeStep is already that share on drawn frames, see the water gate).
+constexpr uintptr_t SITE_MovingFog = 0x53E1AF, EXPECT_MovingFog = 0x716C90, ADDR_FogWind = 0xC6E388;
+VoidFn g_origMovingFog = nullptr;
+void __cdecl HookedMovingFog() {
+    if (!g_smoothFog || g_logicHz <= 0 || g_tickStep <= 0.0f) { g_origMovingFog(); return; }
+    float* wind = reinterpret_cast<float*>(ADDR_FogWind);
+    float share = *reinterpret_cast<const float*>(ADDR_TimeStepF) / g_tickStep;
+    if (!(share >= 0.0f)) share = 0.0f; else if (share > 1.0f) share = 1.0f;
+    const float saved[3] = {wind[0], wind[1], wind[2]};
+    for (int i = 0; i < 3; ++i) wind[i] = saved[i] * share;
+    g_origMovingFog();
+    for (int i = 0; i < 3; ++i) wind[i] = saved[i];
+}
+
+// ---- mirrors and reflective floors (interiors) ----------------------------------------------------------------
+// CMirrors::BeforeConstructRenderList (0x726DF0, called from ConstructRenderList at 0x555854) builds the reflected
+// camera from TheCamera.m_mCameraMatrix (0xB6F99C), which the game only updates on simulation ticks: the reflection
+// moved at 30 fps while the scene follows the blended camera. Around that call the matrix is blended between its
+// last two tick values, then put back.
+constexpr uintptr_t SITE_Mirrors = 0x555854, EXPECT_Mirrors = 0x726DF0, ADDR_CamMatrix = 0xB6F99C;
+VoidFn g_origMirrors = nullptr;
+float g_camMatPrev[16], g_camMatCurr[16];
+unsigned g_camMatTick = ~0u;
+bool g_camMatValid = false;
+void MirrorNorm(float* v) {
+    const float l = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
+    if (l > 1e-6f) { v[0] /= l; v[1] /= l; v[2] /= l; }
+}
+// Puts the blended camera matrix in place (returns false if nothing to do); EndCamMatrixBlend puts the real one back.
+float g_camMatSaved[16];
+bool BeginCamMatrixBlend() {
+    float* m = reinterpret_cast<float*>(ADDR_CamMatrix);
+    if (g_ticks != g_camMatTick) {   // first use after a tick: the matrix holds the new tick's camera
+        g_camMatTick = g_ticks;
+        std::memcpy(g_camMatPrev, g_camMatValid ? g_camMatCurr : m, sizeof g_camMatPrev);
+        std::memcpy(g_camMatCurr, m, sizeof g_camMatCurr);
+        g_camMatValid = true;
+    }
+    const float* a = g_camMatPrev; const float* b = g_camMatCurr;
+    const float d[3] = {b[12] - a[12], b[13] - a[13], b[14] - a[14]};
+    const bool cut = d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > 25.0f || a[8] * b[8] + a[9] * b[9] + a[10] * b[10] < 0.8f;
+    if (!g_interpolate || g_logicHz <= 0 || cut || std::memcmp(m, b, sizeof g_camMatCurr) != 0) return false;
+    std::memcpy(g_camMatSaved, m, sizeof g_camMatSaved);
+    const float t = TickAlpha();
+    for (int r = 0; r < 4; ++r) {
+        for (int k = 0; k < 3; ++k) m[r * 4 + k] = a[r * 4 + k] + (b[r * 4 + k] - a[r * 4 + k]) * t;
+        if (r < 3) MirrorNorm(m + r * 4);
+    }
+    return true;
+}
+void EndCamMatrixBlend() { std::memcpy(reinterpret_cast<float*>(ADDR_CamMatrix), g_camMatSaved, sizeof g_camMatSaved); }
+void __cdecl HookedMirrors() {
+    const bool on = BeginCamMatrixBlend();
+    g_origMirrors();
+    if (on) EndCamMatrixBlend();
+}
+
+// TheCamera's own placement (CPlaceable matrix, CMatrix* at 0xB6F03C): position and axes of the camera as the game
+// code sees them (TheCamera.GetPosition / GetForward). Set on each tick only, while the scene is drawn with the
+// blended RW camera. The sky reads it: its gradient was placed from the camera of the last tick, and the horizon
+// jumped 30 times a second when the camera moved fast (falling under the map). Blended for the whole drawn frame,
+// put back before the next tick.
+float g_tcPrev[16], g_tcCurr[16], g_tcSaved[16];
+float* g_tcPtr = nullptr;
+unsigned g_tcTick = ~0u;
+bool g_tcApplied = false;
+void RestoreTheCamera() {
+    if (g_tcApplied && g_tcPtr && *reinterpret_cast<float**>(0xB6F03C) == g_tcPtr) std::memcpy(g_tcPtr, g_tcSaved, sizeof g_tcSaved);
+    g_tcApplied = false;
+}
+void ApplyTheCamera(float t) {
+    RestoreTheCamera();
+    float* m = *reinterpret_cast<float**>(0xB6F03C);
+    if (!m) { g_tcPtr = nullptr; return; }
+    if (g_ticks != g_tcTick || m != g_tcPtr) {   // first frame after a tick: the matrix holds the new tick's camera
+        std::memcpy(g_tcPrev, m == g_tcPtr ? g_tcCurr : m, sizeof g_tcPrev);
+        std::memcpy(g_tcCurr, m, sizeof g_tcCurr);
+        g_tcTick = g_ticks;
+        g_tcPtr = m;
+    }
+    const float* a = g_tcPrev; const float* b = g_tcCurr;
+    const float d[3] = {b[12] - a[12], b[13] - a[13], b[14] - a[14]};
+    const bool cut = d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > 25.0f || a[4] * b[4] + a[5] * b[5] + a[6] * b[6] < 0.8f;
+    if (cut || std::memcmp(m, b, sizeof g_tcCurr) != 0) return;
+    std::memcpy(g_tcSaved, m, sizeof g_tcSaved);
+    for (int r = 0; r < 4; ++r) {
+        for (int k = 0; k < 3; ++k) m[r * 4 + k] = a[r * 4 + k] + (b[r * 4 + k] - a[r * 4 + k]) * t;
+        if (r < 3) MirrorNorm(m + r * 4);
+    }
+    g_tcApplied = true;
+}
+
+// ---- field of view ----------------------------------------------------------------------------------------------
+// CDraw::ms_fFOV (0x8D5038) is set by the camera on each tick (zoom of the idle camera, aiming, vehicle camera...)
+// and given to the render camera on every drawn frame (0x53EB20): blended between its last two tick values like the
+// camera itself, put back before the next tick.
+constexpr uintptr_t ADDR_Fov = 0x8D5038;
+float g_fovPrev = 0, g_fovCurr = 0;
+unsigned g_fovTick = ~0u;
+bool g_fovApplied = false;
+void ApplyFov(float alpha) {
+    float& fov = *reinterpret_cast<float*>(ADDR_Fov);
+    if (g_ticks != g_fovTick) {
+        g_fovPrev = g_fovTick == ~0u ? fov : g_fovCurr;
+        g_fovCurr = fov;
+        g_fovTick = g_ticks;
+        if (std::fabs(g_fovCurr - g_fovPrev) > 20.0f) g_fovPrev = g_fovCurr;   // camera cut / mode switch: snap
+    }
+    if (g_fovPrev == g_fovCurr) return;
+    fov = g_fovPrev + (g_fovCurr - g_fovPrev) * alpha;
+    g_fovApplied = true;
+}
+void RestoreFov() {
+    if (g_fovApplied) *reinterpret_cast<float*>(ADDR_Fov) = g_fovCurr;
+    g_fovApplied = false;
+}
+
 void __cdecl HookedConstructList() {
     Telemetry::Stamp(Telemetry::M_ListStart);
     // The sea fills draw buckets in this function once per simulated frame and the buckets are emptied when drawn,
     // so on render-only frames it has to run again or the water is missing.
-    if (g_logicHz > 0 && g_renderOnly && g_waterRedo) reinterpret_cast<void(__cdecl*)()>(SITE_WaterFn)();
+    if (g_logicHz > 0 && g_renderOnly && g_waterRedo) { reinterpret_cast<void(__cdecl*)()>(SITE_WaterFn)(); RestoreWaterCounter(); }
     const double t0 = Interp::NowUs();
     if (g_interpolate) Interp::ApplyEntities(TickAlpha());
     if (g_logicHz > 0 && g_renderOnly) SplitRenderOnly();   // after the blend: effects follow the shown entities
@@ -1155,6 +1608,8 @@ void __cdecl HookedConstructList() {
     UpdateStreakStep();
     // the camera too (blended again before RwCameraBeginUpdate): PreRender, shadows and effects see the shown one
     if (g_interpolate) Interp::ApplyCamera(!g_renderOnly, TickAlpha());
+    if (g_interpolate) ApplyFov(TickAlpha()); else RestoreFov();
+    if (g_interpolate && g_logicHz > 0) ApplyTheCamera(TickAlpha()); else RestoreTheCamera();
     if (g_interpolate && g_logicHz > 0) ApplySun(TickAlpha()); else RestoreSun();
     if (g_interpolate && g_logicHz > 0) UpdateStencilShadows();
     Telemetry::Stamp(Telemetry::M_BlendEnd);
@@ -1174,8 +1629,18 @@ using RtShadowsFn = void(__fastcall*)(void*, void*);
 RtShadowsFn g_origRtShadows = nullptr;
 bool g_hierDone = false;
 void __fastcall HookedRtShadows(void* self, void* edx) {
-    if (g_interpolate) { Interp::ApplyHierarchies(!g_renderOnly, TickAlpha()); g_hierDone = true; }
+    if (g_interpolate && !g_hierDone) { Interp::ApplyHierarchies(!g_renderOnly, TickAlpha()); g_hierDone = true; }
     g_origRtShadows(self, edx);
+}
+// Props held by peds (bottle, cigarette, box...): just before the shadows, 0x563430 runs
+// CPedIntelligence::ProcessAfterPreRender (0x6019B0) for every ped, which puts the held object (task
+// TASK_SIMPLE_HOLD_ENTITY, 0x133) on the hand bone. The skeletons were blended only after it: the prop followed the
+// 30 Hz hand. They are blended before it now.
+constexpr uintptr_t SITE_PedsAfterPreRender = 0x53EA03, EXPECT_PedsAfterPreRender = 0x563430;
+VoidFn g_origPedsAfterPreRender = nullptr;
+void __cdecl HookedPedsAfterPreRender() {
+    if (g_interpolate && !g_hierDone) { Interp::ApplyHierarchies(!g_renderOnly, TickAlpha()); g_hierDone = true; }
+    g_origPedsAfterPreRender();
 }
 
 char __cdecl HookedCameraBegin(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e, uint32_t f, uint32_t g) {
@@ -1328,6 +1793,23 @@ void Init(HMODULE self) {
             Log("interpolation hooks installed (enabled=%d)", int(g_interpolate));
             if (HookCall(SITE_RtShadows, reinterpret_cast<void*>(&HookedRtShadows), reinterpret_cast<void**>(&g_origRtShadows), EXPECT_RtShadows))
                 Log("skeletons blended before the ped shadows");
+            if (HookCall(SITE_PedsAfterPreRender, reinterpret_cast<void*>(&HookedPedsAfterPreRender),
+                         reinterpret_cast<void**>(&g_origPedsAfterPreRender), EXPECT_PedsAfterPreRender))
+                Log("skeletons blended before the held props are placed");
+            if (HookCall(SITE_Mirrors, reinterpret_cast<void*>(&HookedMirrors), reinterpret_cast<void**>(&g_origMirrors), EXPECT_Mirrors))
+                Log("mirror camera blended");
+            g_smoothFog = GetPrivateProfileIntW(L"Renewed120", L"SmoothFog", 1, ini) != 0;
+            if (HookCall(SITE_MovingFog, reinterpret_cast<void*>(&HookedMovingFog), reinterpret_cast<void**>(&g_origMovingFog), EXPECT_MovingFog))
+                Log("moving fog speed fix installed (enabled=%d)", int(g_smoothFog));
+            if (HookCall(SITE_Birds1, reinterpret_cast<void*>(&HookedBirds1), reinterpret_cast<void**>(&g_origBirds1), EXPECT_Birds) &&
+                HookCall(SITE_Birds2, reinterpret_cast<void*>(&HookedBirds2), reinterpret_cast<void**>(&g_origBirds2), EXPECT_Birds))
+                Log("birds blended");
+            if (HookCall(SITE_Glass1, reinterpret_cast<void*>(&HookedGlass1), reinterpret_cast<void**>(&g_origGlass1), EXPECT_Glass) &&
+                HookCall(SITE_Glass2, reinterpret_cast<void*>(&HookedGlass2), reinterpret_cast<void**>(&g_origGlass2), EXPECT_Glass))
+                Log("broken glass blended");
+            if (HookCall(SITE_Cannons1, reinterpret_cast<void*>(&HookedCannons1), reinterpret_cast<void**>(&g_origCannons1), EXPECT_Cannons) &&
+                HookCall(SITE_Cannons2, reinterpret_cast<void*>(&HookedCannons2), reinterpret_cast<void**>(&g_origCannons2), EXPECT_Cannons))
+                Log("water cannons blended (render patch=%d, rand hook=%d)", int(PatchCannonRender()), int(HookCannonRand()));
         } else Log("interpolation hooks FAILED, running without interpolation");
     }
     if (g_logicHz > 0 && HookCall(SITE_PreRender, reinterpret_cast<void*>(&HookedPreRender), reinterpret_cast<void**>(&g_origPreRender), EXPECT_PreRender))
@@ -1355,6 +1837,11 @@ void Init(HMODULE self) {
         Log("smooth waves installed (enabled=%d)", int(g_smoothClock));
     if (g_logicHz > 0 && HookCall(SITE_PickupFx, reinterpret_cast<void*>(&HookedPickupFx), reinterpret_cast<void**>(&g_origPickupFx), EXPECT_PickupFx))
         Log("smooth pickups installed (enabled=%d)", int(g_smoothClock));
+    if (g_logicHz > 0 && HookCall(SITE_PickupFx2, reinterpret_cast<void*>(&HookedPickupFx2), reinterpret_cast<void**>(&g_origPickupFx2), EXPECT_PickupFx2))
+        Log("smooth special pickups installed");
+    if (g_logicHz > 0 && HookCall(SITE_MoneyFx, reinterpret_cast<void*>(&HookedMoneyFx), reinterpret_cast<void**>(&g_origMoneyFx), EXPECT_MoneyFx) &&
+        HookCall(SITE_CollectFx, reinterpret_cast<void*>(&HookedCollectFx), reinterpret_cast<void**>(&g_origCollectFx), EXPECT_CollectFx))
+        Log("money and collectables spin smoothly");
     g_smoothSparks = GetPrivateProfileIntW(L"Renewed120", L"SmoothSparks", 1, ini) != 0;
     if (g_logicHz > 0 && HookAddParticle()) {
         Log("smooth sparks/dust emission installed (enabled=%d)", int(g_smoothSparks));
