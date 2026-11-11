@@ -1609,12 +1609,13 @@ void __cdecl HookedConstructList() {
     // the camera too (blended again before RwCameraBeginUpdate): PreRender, shadows and effects see the shown one
     if (g_interpolate) Interp::ApplyCamera(!g_renderOnly, TickAlpha());
     if (g_interpolate) ApplyFov(TickAlpha()); else RestoreFov();
-    if (g_interpolate && g_logicHz > 0) ApplyTheCamera(TickAlpha()); else RestoreTheCamera();
+    RestoreTheCamera();   // the render list is built with the tick camera (blending it there made objects blink)
     if (g_interpolate && g_logicHz > 0) ApplySun(TickAlpha()); else RestoreSun();
     if (g_interpolate && g_logicHz > 0) UpdateStencilShadows();
     Telemetry::Stamp(Telemetry::M_BlendEnd);
     const double t1 = Interp::NowUs();
     g_origConstructList();
+    if (g_interpolate && g_logicHz > 0) ApplyTheCamera(TickAlpha());   // PreRender, sky, effects: the shown camera
     const double t2 = Interp::NowUs();
     Interp::g_timing.applyEntUs += t1 - t0;
     Interp::g_timing.constructUs += t2 - t1;
