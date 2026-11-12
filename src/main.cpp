@@ -423,6 +423,7 @@ int    g_menuSel = 0;
 wchar_t g_iniPath[MAX_PATH];
 
 extern bool g_splitFx;
+extern bool g_camFrame;
 extern bool g_streamEveryFrame;
 extern bool g_staticFix;
 
@@ -461,12 +462,12 @@ void SaveIni() {
     put(L"CutsceneSkeleton", Interp::CutsceneSkeleton()); put(L"WaterFix", g_waterRedo); put(L"StaticShadowFix", g_staticFix);
     put(L"SmoothFx", g_splitFx); put(L"StreamEveryFrame", g_streamEveryFrame); put(L"VehicleGuard", g_freezeVeh); put(L"SmoothSun", g_smoothSun); put(L"SmoothCarShadows", g_smoothCarShadows);
     put(L"SmoothClock", g_smoothClock); put(L"SmoothFog", g_smoothFog); put(L"CarStencilEachFrame", g_stencilFrame); put(L"SmoothSparks", g_smoothSparks);
-    put(L"FpsCap", g_fpsCapSetting); put(L"LogicHz", g_logicHz);
+    put(L"FpsCap", g_fpsCapSetting); put(L"LogicHz", g_logicHz); put(L"CameraEveryFrame", g_camFrame);
 }
 
 // Menu lines in display order (the ini keys are written by SaveIni).
 enum MenuId {
-    M_Interp, M_VehParts, M_PedSkel, M_CutSkel, M_Guard,
+    M_Interp, M_CamFrame, M_VehParts, M_PedSkel, M_CutSkel, M_Guard,
     M_Water, M_Clock, M_Fx, M_Sparks,
     M_StaticShadows, M_Sun, M_CarBlob, M_CarStencil,
     M_Stream, M_FpsCap, M_LogicHz, M_Save, MenuItems
@@ -474,6 +475,7 @@ enum MenuId {
 void MenuChange(int dir) {   // dir: -1 / +1 (Enter = +1)
     switch (g_menuSel) {
     case M_Interp: if (g_interpolate) Interp::Restore(); g_interpolate = !g_interpolate; break;
+    case M_CamFrame: g_camFrame = !g_camFrame; break;
     case M_VehParts: Interp::Restore(); Interp::SetVehicleParts(!Interp::VehicleParts()); break;
     case M_PedSkel: Interp::Restore(); Interp::SetPedSkeleton(!Interp::PedSkeleton()); break;
     case M_CutSkel: Interp::Restore(); Interp::SetCutsceneSkeleton(!Interp::CutsceneSkeleton()); break;
@@ -544,6 +546,7 @@ void DrawMenu() {
         auto onOff = [&](bool v) { strcpy_s(val, v ? "ON" : "OFF"); };
         switch (i) {
         case M_Interp: name = "Interpolation"; onOff(g_interpolate); break;
+        case M_CamFrame: name = "Camera on every frame (no lag)"; onOff(g_camFrame); break;
         case M_VehParts: name = "Vehicle parts (wheels/doors)"; onOff(Interp::VehicleParts()); break;
         case M_PedSkel: name = "Ped skeletons"; onOff(Interp::PedSkeleton()); break;
         case M_CutSkel: name = "Cutscene skeletons"; onOff(Interp::CutsceneSkeleton()); break;
@@ -930,6 +933,7 @@ bool HookAddParticle() {
 
 constexpr uintptr_t ADDR_LoadRequestedModels = 0x40E3A0, ADDR_GameState = 0xC8D4C0;   // gGameState: 9 = playing
 bool g_streamEveryFrame = true;
+extern bool g_camOwed, g_camOwedPrev;
 
 // ---- lights and shadows added by the simulation -------------------------------------------------------------------
 // Idle empties the list of point lights on every drawn frame (CPointLights::NumLights = 0 at 0x53E977) and the shadow
@@ -996,6 +1000,8 @@ void __cdecl HookedGameProcess() {
     if (!g_smoothSparks) ReleaseParticles(1.0f, true);   // switched off: nothing left waiting
     g_inTick = true;
     BeginTickLights();
+    g_camOwedPrev = g_camOwed;
+    g_camOwed = false;   // set again by the tick if it skips its camera update (see CameraEveryFrame)
     g_origGameProcess();
     RestoreWaterCounter();   // CGame::Process ends with a jump to the water function
     CaptureTickLights();
@@ -1125,14 +1131,107 @@ constexpr uintptr_t SITE_Markers = 0x726AE4, EXPECT_Markers = 0x725040;
 constexpr uintptr_t ADDR_MarkerFlags = 0xC7DD88 + 0x22;   // C3dMarkers::m_aMarkerArray[32], stride 0xA0
 VoidFn g_origMarkers = nullptr;
 uint8_t g_markerFlags[32][2];
+// A marker moves, turns and pulses in C3dMarkers::PlaceMarker (0x725120), i.e. when a script or the game places it, once
+// per tick: its matrix (C3dMarker +0, CMatrix: the cone bobbing in front of a door, the turning arrows) and its size
+// (+0x6C, the pulse of the rings). Around the render each marker placed on the last two ticks is put at the blend of
+// these two states, then put back. Markers: 32 at 0xC7DD58, stride 0xA0; in use +0x52, identifier +0x54.
+constexpr uintptr_t ADDR_Markers = 0xC7DD58;
+constexpr int NumMarkers = 32, MarkerStride = 0xA0;
+struct MarkerState { float m[16]; float size; uint32_t id; bool used; };
+MarkerState g_markerPrev[NumMarkers], g_markerCurr[NumMarkers];
+unsigned g_markerTick = ~0u;
+void BlendAxis(const float* a, const float* b, float t, float* o);
+void ReadMarker(int i, MarkerState& st) {
+    const uint8_t* mk = reinterpret_cast<const uint8_t*>(ADDR_Markers + MarkerStride * i);
+    std::memcpy(st.m, mk, sizeof st.m);
+    st.size = *reinterpret_cast<const float*>(mk + 0x6C);
+    st.id = *reinterpret_cast<const uint32_t*>(mk + 0x54);
+    st.used = mk[0x52] != 0;
+}
 void __cdecl HookedMarkers() {
     uint8_t* f = reinterpret_cast<uint8_t*>(ADDR_MarkerFlags);
     for (int k = 0; k < 32; ++k, f += 0xA0) {
         if (!g_renderOnly) { g_markerFlags[k][0] = f[0]; g_markerFlags[k][1] = f[1]; }
         else { f[0] |= g_markerFlags[k][0]; f[1] |= g_markerFlags[k][1]; }
     }
+    if (!g_interpolate || g_logicHz <= 0) { g_origMarkers(); return; }
+    if (g_markerTick != g_ticks) {   // first draw after a tick: the markers hold the new tick's state
+        g_markerTick = g_ticks;
+        for (int i = 0; i < NumMarkers; ++i) {
+            MarkerState now; ReadMarker(i, now);
+            const MarkerState& c = g_markerCurr[i];
+            const float d[3] = {now.m[12] - c.m[12], now.m[13] - c.m[13], now.m[14] - c.m[14]};
+            const bool fresh = !c.used || !now.used || c.id != now.id || d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > 25.0f;
+            g_markerPrev[i] = fresh ? now : c;
+            g_markerCurr[i] = now;
+        }
+    }
+    const float t = TickAlpha();
+    static float savedM[NumMarkers][16], savedSize[NumMarkers];
+    bool set[NumMarkers];
+    for (int i = 0; i < NumMarkers; ++i) {
+        uint8_t* mk = reinterpret_cast<uint8_t*>(ADDR_Markers + MarkerStride * i);
+        const MarkerState& a = g_markerPrev[i]; const MarkerState& b = g_markerCurr[i];
+        set[i] = mk[0x52] != 0 && b.used && *reinterpret_cast<const uint32_t*>(mk + 0x54) == b.id &&
+                 std::memcmp(mk, b.m, sizeof b.m) == 0 && (std::memcmp(a.m, b.m, sizeof b.m) != 0 || a.size != b.size);
+        if (!set[i]) continue;
+        float* m = reinterpret_cast<float*>(mk);
+        std::memcpy(savedM[i], m, sizeof savedM[i]);
+        savedSize[i] = *reinterpret_cast<const float*>(mk + 0x6C);
+        for (int r = 0; r < 3; ++r) BlendAxis(a.m + r * 4, b.m + r * 4, t, m + r * 4);
+        for (int k = 0; k < 3; ++k) m[12 + k] = a.m[12 + k] + (b.m[12 + k] - a.m[12 + k]) * t;
+        *reinterpret_cast<float*>(mk + 0x6C) = a.size + (b.size - a.size) * t;
+    }
     g_origMarkers();
+    for (int i = 0; i < NumMarkers; ++i) {
+        if (!set[i]) continue;
+        uint8_t* mk = reinterpret_cast<uint8_t*>(ADDR_Markers + MarkerStride * i);
+        std::memcpy(mk, savedM[i], sizeof savedM[i]);
+        *reinterpret_cast<float*>(mk + 0x6C) = savedSize[i];
+    }
 }
+
+// ---- ropes (crane, magnet, helicopter winch) ---------------------------------------------------------------------
+// CRopes::Update (0x558D70, in the tick) moves the 32 points of each rope (8 at 0xB768B8, stride 0x328: points at +0,
+// in use +0x325); CRopes::Render (0x556AE0, called at 0x53DE30 and 0x53E17A) draws them on every frame where the last
+// tick left them, while what they hang from is shown blended. Around the render each point is put at the blend of its
+// last two tick places.
+constexpr uintptr_t SITE_Ropes1 = 0x53DE30, SITE_Ropes2 = 0x53E17A, EXPECT_Ropes = 0x556AE0, ADDR_Ropes = 0xB768B8;
+constexpr int NumRopes = 8, RopeStride = 0x328, RopePoints = 32;
+VoidFn g_origRopes1 = nullptr, g_origRopes2 = nullptr;
+struct RopeState { float p[RopePoints][3]; bool used; };
+RopeState g_ropePrev[NumRopes], g_ropeCurr[NumRopes];
+unsigned g_ropeTick = ~0u;
+uint8_t* Rope(int i) { return reinterpret_cast<uint8_t*>(ADDR_Ropes + RopeStride * i); }
+void RenderRopes(VoidFn orig) {
+    if (!g_interpolate || g_logicHz <= 0) { orig(); return; }
+    if (g_ropeTick != g_ticks) {
+        g_ropeTick = g_ticks;
+        for (int i = 0; i < NumRopes; ++i) {
+            RopeState now; std::memcpy(now.p, Rope(i), sizeof now.p); now.used = Rope(i)[0x325] != 0;
+            const RopeState& c = g_ropeCurr[i];
+            const float d[3] = {now.p[0][0] - c.p[0][0], now.p[0][1] - c.p[0][1], now.p[0][2] - c.p[0][2]};
+            const bool fresh = !c.used || !now.used || d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > 400.0f;
+            g_ropePrev[i] = fresh ? now : c;
+            g_ropeCurr[i] = now;
+        }
+    }
+    const float t = TickAlpha();
+    static float saved[NumRopes][RopePoints][3];
+    bool set[NumRopes];
+    for (int i = 0; i < NumRopes; ++i) {
+        float* pts = reinterpret_cast<float*>(Rope(i));
+        set[i] = Rope(i)[0x325] != 0 && g_ropeCurr[i].used && std::memcmp(pts, g_ropeCurr[i].p, sizeof g_ropeCurr[i].p) == 0;
+        if (!set[i]) continue;
+        std::memcpy(saved[i], pts, sizeof saved[i]);
+        const float* a = &g_ropePrev[i].p[0][0]; const float* b = &g_ropeCurr[i].p[0][0];
+        for (int k = 0; k < RopePoints * 3; ++k) pts[k] = a[k] + (b[k] - a[k]) * t;
+    }
+    orig();
+    for (int i = 0; i < NumRopes; ++i) if (set[i]) std::memcpy(Rope(i), saved[i], sizeof saved[i]);
+}
+void __cdecl HookedRopes1() { RenderRopes(g_origRopes1); }
+void __cdecl HookedRopes2() { RenderRopes(g_origRopes2); }
 
 // ---- particles and broken-object pieces ---------------------------------------------------------------------
 // CGame::Process advances the effect system (Fx_c::Update, call at 0x53C1F0, dt in seconds) and the pieces of broken
@@ -1578,7 +1677,9 @@ void MirrorNorm(float* v) {
 }
 // Puts the blended camera matrix in place (returns false if nothing to do); EndCamMatrixBlend puts the real one back.
 float g_camMatSaved[16];
+extern bool g_camLive;
 bool BeginCamMatrixBlend() {
+    if (g_camLive) return false;   // the camera is run on every frame: the matrix is this frame's already
     float* m = reinterpret_cast<float*>(ADDR_CamMatrix);
     if (g_ticks != g_camMatTick) {   // first use after a tick: the matrix holds the new tick's camera
         g_camMatTick = g_ticks;
@@ -1665,6 +1766,125 @@ void RestoreFov() {
     g_fovApplied = false;
 }
 
+// ---- camera on every drawn frame ---------------------------------------------------------------------------------
+// The camera was simulated with the rest of the game (CCamera::Process 0x52B730, called at 0x53C104 in CGame::Process)
+// and shown blended between its last two ticks: what the mouse or the stick did was seen one tick late (33 ms at 30 Hz)
+// on top of the wait for the next tick. Here the tick skips its camera update and every drawn frame runs it instead,
+// after the entities were blended (the camera follows the player as shown), with the share of the tick's time step
+// that elapsed and the mouse moves made since the previous frame: the view answers on the next drawn frame, as in the
+// original game running at that frame rate. The camera blends (RW camera, TheCamera, FOV, mirrors) are then off.
+// Not during cutscenes (their camera follows the cutscene clock, which only moves on ticks: the blend stays), replays
+// or menus.
+//
+// The mouse: CPad::UpdateMouse (0x53F3C0, called at 0x541DD7 in CPad::UpdatePads once per tick) reads the moves since
+// its previous call into NewMouseControllerState (0xB73418: buttons, wheel up/down flags, then z, x, y floats; the
+// previous state goes to 0xB7342C). It is also run on the frames between two ticks, for the camera; what those reads
+// took is given back to the tick's own read (moves and wheel summed, previous state = the previous tick's), so the
+// simulation still sees everything since its last tick (weapon wheel, mouse steering).
+constexpr uintptr_t SITE_CameraProcess = 0x53C104, EXPECT_CameraProcess = 0x52B730, ADDR_TheCamera = 0xB6F028;
+constexpr uintptr_t SITE_UpdateMouse = 0x541DD7, EXPECT_UpdateMouse = 0x53F3C0;
+constexpr uintptr_t ADDR_NewMouse = 0xB73418, ADDR_OldMouse = 0xB7342C, ADDR_Pad0 = 0xB73458;
+struct MouseState { uint8_t lmb, rmb, mmb, wheelUp, wheelDown, b1, b2, pad; float z, x, y; };
+static_assert(sizeof(MouseState) == 0x14, "CMouseControllerState");
+ThisFn g_origCameraProcess = nullptr, g_origUpdateMouse = nullptr;
+bool g_camFrame = false;      // ini CameraEveryFrame
+bool g_camHooks = false;
+bool g_camOwed = false;       // the last tick skipped its camera update: the drawn frames run it
+bool g_camLive = false;       // the camera is run on every frame now (no camera blend)
+MouseState g_mouseFresh{}, g_mouseTickPrev{};
+float g_mouseAcc[3] = {};     // z, x, y taken by the reads between two ticks
+bool g_mouseAccUp = false, g_mouseAccDown = false, g_mouseSub = false;
+SplitState g_camSplit;
+// Only the views the player steers: on foot, behind a vehicle, aiming. Every other camera (scripted and fixed mission
+// cameras, the cinematic vehicle camera, wasted / busted, first person...) keeps the tick camera and its blend, as
+// before: some of them move by a fixed amount per call (they shook six times too fast when run on every frame), or
+// follow something that is not blended yet when the camera runs. Mode of the active camera: TheCamera.Cams[ActiveCam]
+// (ActiveCam: byte at +0x59; Cams at +0x174, 0x238 bytes each; Mode: uint16 at +0xC).
+bool CamModeSteered() {
+    const uint8_t active = *reinterpret_cast<const uint8_t*>(ADDR_TheCamera + 0x59);
+    if (active > 2) return false;
+    switch (*reinterpret_cast<const uint16_t*>(ADDR_TheCamera + 0x174 + 0x238 * active + 0xC)) {
+    case 3: case 4: case 18: case 22:              // behind car, follow ped, cam on a string (vehicles), behind boat
+    case 7: case 8: case 46: case 51:              // sniper, rocket launcher, M16 first person, heat seeking launcher
+    case 53: case 55: case 65: return true;        // aim weapon: on foot, from a car, attached
+    default: return false;
+    }
+}
+// The idle camera (the view that wanders to passers-by when nothing is pressed for a while) hides the HUD by stamping
+// the frame counter into 0xB6EC40 each time it runs (0x522D25): stamped on the last tick or since, it is on. It shakes
+// by a fixed amount per call: it stays on the tick camera too.
+bool IdleCamOn() {
+    const uint32_t stamp = *reinterpret_cast<const uint32_t*>(0xB6EC40), ctr = *reinterpret_cast<const uint32_t*>(ADDR_FrameCtrW);
+    return stamp == ctr || stamp + 1 == ctr;
+}
+bool CamFrameWanted() {
+    return g_camFrame && g_camHooks && g_logicHz > 0 && g_interpolate && *reinterpret_cast<const int*>(ADDR_GameState) == 9 &&
+           !*reinterpret_cast<const uint8_t*>(ADDR_MenuActive) && !*reinterpret_cast<const uint8_t*>(0xB5F851) &&   // CCutsceneMgr::ms_running
+           CamModeSteered() && !IdleCamOn();
+}
+// Idle does not build nor draw the scene while the screen is fully faded out (CCamera::GetScreenFadeStatus() == 2 at
+// 0x53E9BE: fade alpha, TheCamera +0xBFC, at 255), so the drawn frames do not reach CameraEveryFrame then. The fade
+// itself is run by the camera update: left to the frames, it stayed black for ever after walking through a door. The
+// tick keeps its own camera update while the screen is black, and also whenever the frames since the previous tick
+// did not run the one they owed (anything else that skips the scene).
+bool g_camOwedPrev = false, g_camRan = false;
+void __fastcall HookedCameraProcess(void* self, void* edx) {
+    const bool black = *reinterpret_cast<const float*>(ADDR_TheCamera + 0xBFC) >= 254.5f;
+    const bool missed = g_camOwedPrev && !g_camRan;
+    if (CamFrameWanted() && !black && !missed) { g_camOwed = true; g_camRan = false; return; }   // run by the drawn frames
+    g_origCameraProcess(self, edx);
+}
+void __fastcall HookedUpdateMouse(void* self, void* edx) {
+    g_origUpdateMouse(self, edx);
+    MouseState& n = *reinterpret_cast<MouseState*>(ADDR_NewMouse);
+    g_mouseFresh = n;
+    if (g_mouseSub) {
+        n.z += g_mouseAcc[0]; n.x += g_mouseAcc[1]; n.y += g_mouseAcc[2];
+        n.wheelUp |= uint8_t(g_mouseAccUp); n.wheelDown |= uint8_t(g_mouseAccDown);
+        *reinterpret_cast<MouseState*>(ADDR_OldMouse) = g_mouseTickPrev;
+    }
+    g_mouseAcc[0] = g_mouseAcc[1] = g_mouseAcc[2] = 0.0f;
+    g_mouseAccUp = g_mouseAccDown = g_mouseSub = false;
+    g_mouseTickPrev = n;
+}
+void CameraEveryFrame() {
+    const bool live = g_camOwed && CamFrameWanted();
+    if (live != g_camLive) {   // from the blend to the live camera or back: nothing kept from the other way
+        g_camLive = live;
+        Interp::ForgetCamera();
+        RestoreFov();
+        RestoreTheCamera();
+        g_camMatValid = false;
+        g_camSplit.last = 0;
+    }
+    if (!live) return;
+    MouseState& n = *reinterpret_cast<MouseState*>(ADDR_NewMouse);
+    uint8_t* pad = reinterpret_cast<uint8_t*>(ADDR_Pad0);   // CPad: NewState (0x30 bytes), then OldState
+    const bool tickFrame = !g_renderOnly;
+    const MouseState tickMouse = n;
+    uint8_t oldState[0x30];
+    if (tickFrame) n = g_mouseFresh;   // the tick's own read: what was not shown yet
+    else {
+        n.z = n.x = n.y = 0.0f; n.wheelUp = n.wheelDown = 0;   // stays so if the mouse can't be read (window not active)
+        g_origUpdateMouse(pad, nullptr);
+        g_mouseAcc[0] += n.z; g_mouseAcc[1] += n.x; g_mouseAcc[2] += n.y;
+        g_mouseAccUp |= n.wheelUp != 0; g_mouseAccDown |= n.wheelDown != 0;
+        g_mouseSub = true;
+        // a button pressed at the last tick is "just pressed" until the next one: only the tick frame may see that
+        // (change of view: once per press, not once per drawn frame)
+        std::memcpy(oldState, pad + 0x30, 0x30);
+        std::memcpy(pad + 0x30, pad, 0x30);
+    }
+    float& step = *reinterpret_cast<float*>(ADDR_TimeStepF);
+    const float savedStep = step;
+    step = g_tickStep * SplitFrac(g_camSplit);
+    { ClockShift shift; g_origCameraProcess(reinterpret_cast<void*>(ADDR_TheCamera), nullptr); }
+    g_camRan = true;
+    step = savedStep;
+    if (tickFrame) n = tickMouse;
+    else std::memcpy(pad + 0x30, oldState, 0x30);
+}
+
 void __cdecl HookedConstructList() {
     Telemetry::Stamp(Telemetry::M_ListStart);
     // The sea fills draw buckets in this function once per simulated frame and the buckets are emptied when drawn,
@@ -1672,19 +1892,20 @@ void __cdecl HookedConstructList() {
     if (g_logicHz > 0 && g_renderOnly && g_waterRedo) { reinterpret_cast<void(__cdecl*)()>(SITE_WaterFn)(); RestoreWaterCounter(); }
     const double t0 = Interp::NowUs();
     if (g_interpolate) Interp::ApplyEntities(TickAlpha());
+    CameraEveryFrame();   // after the blend: the camera follows the shown player
     if (g_logicHz > 0 && g_renderOnly) SplitRenderOnly();   // after the blend: effects follow the shown entities
     if (g_logicHz > 0) ReleaseParticles(TickAlpha());   // what the simulation emitted, spread over the drawn frames
     UpdateStreakStep();
     // the camera too (blended again before RwCameraBeginUpdate): PreRender, shadows and effects see the shown one
-    if (g_interpolate) Interp::ApplyCamera(!g_renderOnly, TickAlpha());
-    if (g_interpolate) ApplyFov(TickAlpha()); else RestoreFov();
+    if (g_interpolate && !g_camLive) Interp::ApplyCamera(!g_renderOnly, TickAlpha());
+    if (g_interpolate && !g_camLive) ApplyFov(TickAlpha()); else RestoreFov();
     RestoreTheCamera();   // the render list is built with the tick camera (blending it there made objects blink)
     if (g_interpolate && g_logicHz > 0) ApplySun(TickAlpha()); else RestoreSun();
     if (g_interpolate && g_logicHz > 0) UpdateStencilShadows();
     Telemetry::Stamp(Telemetry::M_BlendEnd);
     const double t1 = Interp::NowUs();
     g_origConstructList();
-    if (g_interpolate && g_logicHz > 0) ApplyTheCamera(TickAlpha());   // PreRender, sky, effects: the shown camera
+    if (g_interpolate && g_logicHz > 0 && !g_camLive) ApplyTheCamera(TickAlpha());   // PreRender, sky, effects: the shown camera
     const double t2 = Interp::NowUs();
     Interp::g_timing.applyEntUs += t1 - t0;
     Interp::g_timing.constructUs += t2 - t1;
@@ -1717,7 +1938,7 @@ char __cdecl HookedCameraBegin(uint32_t a, uint32_t b, uint32_t c, uint32_t d, u
     const double t0 = Interp::NowUs();
     if (g_interpolate) {
         if (!g_hierDone) Interp::ApplyHierarchies(!g_renderOnly, TickAlpha());
-        Interp::ApplyCamera(!g_renderOnly, TickAlpha());
+        if (!g_camLive) Interp::ApplyCamera(!g_renderOnly, TickAlpha());
     }
     g_hierDone = false;
     Interp::g_timing.applyCamUs += Interp::NowUs() - t0;
@@ -1930,6 +2151,13 @@ void Init(HMODULE self) {
         SetVehShadowPatch(GetPrivateProfileIntW(L"Renewed120", L"SmoothCarShadows", 1, ini) != 0);
         Log("car shadow per-frame patch installed (enabled=%d)", int(g_smoothCarShadows));
     }
+    g_camFrame = GetPrivateProfileIntW(L"Renewed120", L"CameraEveryFrame", 0, ini) != 0;
+    if (g_logicHz > 0 &&
+        HookCall(SITE_CameraProcess, reinterpret_cast<void*>(&HookedCameraProcess), reinterpret_cast<void**>(&g_origCameraProcess), EXPECT_CameraProcess) &&
+        HookCall(SITE_UpdateMouse, reinterpret_cast<void*>(&HookedUpdateMouse), reinterpret_cast<void**>(&g_origUpdateMouse), EXPECT_UpdateMouse)) {
+        g_camHooks = true;
+        Log("camera on every frame installed (enabled=%d)", int(g_camFrame));
+    }
     g_staticFix = GetPrivateProfileIntW(L"Renewed120", L"StaticShadowFix", 1, ini) != 0;
     g_tickLights = GetPrivateProfileIntW(L"Renewed120", L"LightsEveryFrame", 1, ini) != 0;
     Log("lights and shadows of the simulation kept on every frame: %d", int(g_tickLights));
@@ -1939,6 +2167,10 @@ void Init(HMODULE self) {
         Log("static shadow fix installed (enabled=%d)", int(g_staticFix));
     if (g_logicHz > 0 && HookCall(SITE_Markers, reinterpret_cast<void*>(&HookedMarkers), reinterpret_cast<void**>(&g_origMarkers), EXPECT_Markers))
         Log("3D markers fix installed");
+    if (g_logicHz > 0 &&
+        HookCall(SITE_Ropes1, reinterpret_cast<void*>(&HookedRopes1), reinterpret_cast<void**>(&g_origRopes1), EXPECT_Ropes) &&
+        HookCall(SITE_Ropes2, reinterpret_cast<void*>(&HookedRopes2), reinterpret_cast<void**>(&g_origRopes2), EXPECT_Ropes))
+        Log("ropes blended");
     g_smoothClock = GetPrivateProfileIntW(L"Renewed120", L"SmoothClock", 1, ini) != 0;
     g_stencilFrame = GetPrivateProfileIntW(L"Renewed120", L"CarStencilEachFrame", 1, ini) != 0;
     if (g_logicHz > 0 &&

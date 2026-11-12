@@ -8,8 +8,15 @@ VSync, and a pass over the timing of the drawn frames.
 - **VSync** (`VSync=1`): no tearing. With `FpsCap=0` or `-1` the frame rate follows the monitor. It goes through the
   game's own setting, in borderless and exclusive fullscreen.
 - `LightsEveryFrame`: see below.
+- **Camera on every frame** (`CameraEveryFrame=1`, experimental, off by default): the game's camera runs on every
+  drawn frame instead of being shown one simulation step late. The view answers the mouse or the stick on the next
+  frame. Only for the views you steer (on foot, behind a vehicle, aiming): cutscenes, the cinematic, idle,
+  first-person and scripted cameras keep the blended camera.
 
 ### Fixed
+- **Moving 3D markers** (the cone bobbing in front of a door, turning arrows, pulsing rings) and **ropes** (crane,
+  magnet, helicopter winch) move smoothly: they moved 30 times a second.
+- **Animated objects** in the game (the basketball in CJ's hands...) follow their animation on every frame.
 - **Lights of fires, explosions and gunshots**, and the lights and shadows drawn by mission scripts, were only there
   on one drawn frame per simulation step (one out of six at 180 fps): they are kept on every frame.
 - **Small shake of the car against the camera** without a frame cap: everything in a frame is now blended for the
