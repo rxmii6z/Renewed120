@@ -11,6 +11,8 @@ struct Timing {
 };
 extern Timing g_timing;
 double NowUs();
+// A pool of the game holds more entities than the blend tables (a limit adjuster): those beyond are not blended.
+bool PoolOverflow();
 
 void SetVehicleParts(bool on);      // blend vehicle child frames (wheels, doors, forks)
 bool VehicleParts();
