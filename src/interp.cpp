@@ -737,6 +737,58 @@ double NowUs() {
 
 bool PoolOverflow() { return g_poolOverflow; }
 void ForgetCamera() { g_cam.valid = g_cam.applied = false; }
+
+// The camera run on every frame turns the player to where it aims (CameraEveryFrame). Running while aiming, that is
+// far from the heading of the simulation (he runs one way, aims another): the blend took it for another mod moving
+// him (MovedByOther) and left him where he was until the next tick (30 Hz while running and aiming). The pose the
+// camera leaves is noted as the one shown.
+void NoteShownByCamera(uintptr_t ent) {
+    for (auto& s : g_ped) {
+        if (!s.valid || s.ent != ent) continue;
+        Pose now{};
+        if (ReadEntityPose(s.ent, now)) s.shown = now;
+        return;
+    }
+}
+
+// The aiming camera (CCam::Process_AimWeapon, 0x521500) follows a bone of the player (GetBonePosition, spine 3, at
+// 0x521EDC). Run on every drawn frame (CameraEveryFrame) it reads the skeleton as the previous frame showed it, except
+// on the frame of a tick, where the game has just posed it one tick ahead: the view stepped sideways by a few
+// millimetres 30 times a second (a fast left-right shake while aiming). The skeleton shown on the last frame before
+// the tick is kept, and the camera of the tick frame reads that one too.
+uint8_t g_shownSkel[MaxHier * 0x40];
+void* g_shownHier = nullptr; uint8_t* g_shownMats = nullptr; int g_shownN = 0;
+uint32_t g_shownFlags = 0; bool g_shownSwapped = false;
+void KeepShownPlayerSkeleton() {
+    g_shownHier = nullptr; g_shownSwapped = false;
+    const uintptr_t ped = *reinterpret_cast<const uintptr_t*>(0xB7CD98);   // CWorld::Players[0].m_pPed
+    void* h = nullptr; uint8_t* m = nullptr; int n = 0;
+    if (!ped || !GetHier(ped, h, m, n)) return;
+    __try { std::memcpy(g_shownSkel, m, n * 0x40); g_shownHier = h; g_shownMats = m; g_shownN = n; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { g_shownHier = nullptr; }
+}
+bool SwapShownPlayerSkeleton() {
+    if (!g_shownHier) return false;
+    const uintptr_t ped = *reinterpret_cast<const uintptr_t*>(0xB7CD98);
+    void* h = nullptr; uint8_t* m = nullptr; int n = 0;
+    if (!ped || !GetHier(ped, h, m, n) || h != g_shownHier || m != g_shownMats || n != g_shownN) { g_shownHier = nullptr; return false; }
+    // CPed::GetBonePosition, as the camera calls it, poses the skeleton again from the animation (UpdateRpHAnim,
+    // 0x532B20) when the ped's "posed this frame" flag (0x400 of +0x474) is clear, as it is right after a tick: that
+    // overwrote the skeleton put here. The flag is raised while it is swapped in, and put back with it.
+    uint32_t& flags = *reinterpret_cast<uint32_t*>(ped + 0x474);
+    if (!g_shownSwapped) { g_shownFlags = flags; flags |= 0x400u; }
+    else flags = g_shownFlags;
+    g_shownSwapped = !g_shownSwapped;
+    __try {
+        uint8_t tmp[0x40];
+        for (int i = 0; i < n; ++i) {
+            std::memcpy(tmp, m + i * 0x40, 0x40);
+            std::memcpy(m + i * 0x40, g_shownSkel + i * 0x40, 0x40);
+            std::memcpy(g_shownSkel + i * 0x40, tmp, 0x40);
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_shownHier = nullptr; return false; }
+}
 void SetVehicleParts(bool on) { g_vehParts = on; }
 bool VehicleParts() { return g_vehParts; }
 void SetPedSkeleton(bool on) { g_pedSkeleton = on; }

@@ -608,6 +608,7 @@ void __cdecl HookedTimerUpdate() {
         const double t0 = Interp::NowUs();
         RestoreWaterTiming();
         FlushGuard();
+        if (g_interpolate && g_camFrame) Interp::KeepShownPlayerSkeleton();   // see CameraEveryFrame
         Interp::Restore();   // the simulation must see the real, latest state
         if (menu) Interp::Reset();   // a save may be loaded from the menu: see Interp::Reset
         RestoreSun();
@@ -1794,6 +1795,7 @@ bool g_camLive = false;       // the camera is run on every frame now (no camera
 MouseState g_mouseFresh{}, g_mouseTickPrev{};
 float g_mouseAcc[3] = {};     // z, x, y taken by the reads between two ticks
 bool g_mouseAccUp = false, g_mouseAccDown = false, g_mouseSub = false;
+bool g_mouseHasAcc = false;   // this tick's mouse read also holds what the drawn frames already gave the camera
 SplitState g_camSplit;
 // Only the views the player steers: on foot, behind a vehicle, aiming. Every other camera (scripted and fixed mission
 // cameras, the cinematic vehicle camera, wasted / busted, first person...) keeps the tick camera and its blend, as
@@ -1832,7 +1834,13 @@ void __fastcall HookedCameraProcess(void* self, void* edx) {
     const bool black = *reinterpret_cast<const float*>(ADDR_TheCamera + 0xBFC) >= 254.5f;
     const bool missed = g_camOwedPrev && !g_camRan;
     if (CamFrameWanted() && !black && !missed) { g_camOwed = true; g_camRan = false; return; }   // run by the drawn frames
+    // Back on the tick camera (a door fade, a camera that is not steered): the mouse movement the drawn frames already
+    // gave the camera is not given to it a second time (the view jumped once).
+    MouseState& n = *reinterpret_cast<MouseState*>(ADDR_NewMouse);
+    const MouseState read = n;
+    if (g_mouseHasAcc) n = g_mouseFresh;
     g_origCameraProcess(self, edx);
+    n = read;
 }
 void __fastcall HookedUpdateMouse(void* self, void* edx) {
     g_origUpdateMouse(self, edx);
@@ -1843,10 +1851,44 @@ void __fastcall HookedUpdateMouse(void* self, void* edx) {
         n.wheelUp |= uint8_t(g_mouseAccUp); n.wheelDown |= uint8_t(g_mouseAccDown);
         *reinterpret_cast<MouseState*>(ADDR_OldMouse) = g_mouseTickPrev;
     }
+    g_mouseHasAcc = g_mouseSub;
     g_mouseAcc[0] = g_mouseAcc[1] = g_mouseAcc[2] = 0.0f;
     g_mouseAccUp = g_mouseAccDown = g_mouseSub = false;
     g_mouseTickPrev = n;
 }
+// The player's heading as the camera left it: the rotation rows of its CMatrix (CPlaceable +0x14) and of the modelling
+// matrix of its RwFrame (RwObject +0x18, frame at +4, matrix rows at +0x10).
+constexpr uintptr_t ADDR_PlayerPed = 0xB7CD98;   // CWorld::Players[0].m_pPed
+struct AimHeading { uintptr_t ped = 0; float mat[12], frame[12]; float pos[3]; bool valid = false; } g_aimHeading;
+float* PedMatrix(uintptr_t ped) { return *reinterpret_cast<float**>(ped + 0x14); }
+float* PedFrame(uintptr_t ped) {
+    const uintptr_t rw = *reinterpret_cast<const uintptr_t*>(ped + 0x18);
+    return rw ? *reinterpret_cast<float**>(rw + 4) : nullptr;
+}
+void KeepAimHeading(uintptr_t ped) {
+    g_aimHeading.valid = false;
+    if (!ped) return;
+    float* m = PedMatrix(ped); float* f = PedFrame(ped);
+    if (!m || !f) return;
+    std::memcpy(g_aimHeading.mat, m, sizeof g_aimHeading.mat);
+    std::memcpy(g_aimHeading.frame, f + 4, sizeof g_aimHeading.frame);
+    std::memcpy(g_aimHeading.pos, m + 12, sizeof g_aimHeading.pos);
+    g_aimHeading.ped = ped; g_aimHeading.valid = true;
+}
+void PutAimHeading(uintptr_t ped) {
+    if (!g_aimHeading.valid || !ped || ped != g_aimHeading.ped) return;
+    const uint16_t mode = *reinterpret_cast<const uint16_t*>(ADDR_TheCamera + 0x174 + 0x238 * *reinterpret_cast<const uint8_t*>(ADDR_TheCamera + 0x59) + 0xC);
+    // aiming on foot only (weapon, sniper, rocket launcher, M16 first person, heat seeker): from a vehicle the player
+    // follows the vehicle
+    if (!(mode == 53 || mode == 7 || mode == 8 || mode == 46 || mode == 51)) return;
+    float* m = PedMatrix(ped); float* f = PedFrame(ped);
+    if (!m || !f) return;
+    const float d[3] = {m[12] - g_aimHeading.pos[0], m[13] - g_aimHeading.pos[1], m[14] - g_aimHeading.pos[2]};
+    if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > 4.0f) return;   // moved far (teleport...): leave it
+    std::memcpy(m, g_aimHeading.mat, sizeof g_aimHeading.mat);
+    std::memcpy(f + 4, g_aimHeading.frame, sizeof g_aimHeading.frame);
+}
+
 void CameraEveryFrame() {
     const bool live = g_camOwed && CamFrameWanted();
     if (live != g_camLive) {   // from the blend to the live camera or back: nothing kept from the other way
@@ -1857,7 +1899,7 @@ void CameraEveryFrame() {
         g_camMatValid = false;
         g_camSplit.last = 0;
     }
-    if (!live) return;
+    if (!live) { g_aimHeading.valid = false; return; }   // kept only from one live frame to the next
     MouseState& n = *reinterpret_cast<MouseState*>(ADDR_NewMouse);
     uint8_t* pad = reinterpret_cast<uint8_t*>(ADDR_Pad0);   // CPad: NewState (0x30 bytes), then OldState
     const bool tickFrame = !g_renderOnly;
@@ -1878,7 +1920,19 @@ void CameraEveryFrame() {
     float& step = *reinterpret_cast<float*>(ADDR_TimeStepF);
     const float savedStep = step;
     step = g_tickStep * SplitFrac(g_camSplit);
+    // The aiming cameras turn the player to where they aim, and place themselves from the player's heading and from a
+    // bone of the player. The tick puts both back as the game simulated them (another heading, by a few degrees; the
+    // skeleton one tick ahead): run on the tick frame from there, the camera stood a few millimetres aside, 30 times a
+    // second (a fast left-right shake while aiming). The camera always starts from the heading it gave the player on
+    // the last frame (on the drawn frames too: while turning, the blend of the ticks put another one), and on the
+    // tick frame from the skeleton that frame showed (see Interp::SwapShownPlayerSkeleton).
+    const uintptr_t player = *reinterpret_cast<const uintptr_t*>(ADDR_PlayerPed);
+    PutAimHeading(player);   // every frame: the blend of the ticks' headings (rotating) is not where the camera left it
+    const bool skel = tickFrame && Interp::SwapShownPlayerSkeleton();
     { ClockShift shift; g_origCameraProcess(reinterpret_cast<void*>(ADDR_TheCamera), nullptr); }
+    if (skel) Interp::SwapShownPlayerSkeleton();
+    KeepAimHeading(player);
+    if (player) Interp::NoteShownByCamera(player);
     g_camRan = true;
     step = savedStep;
     if (tickFrame) n = tickMouse;
