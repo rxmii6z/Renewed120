@@ -7,8 +7,9 @@
 # Needs the secret NEXUSMODS in the repository settings (Settings > Secrets and variables > Actions): the API
 # key of the Nexus account (nexusmods.com > Settings > API Keys).
 #
-# The ids below are the API's own ids, not the numbers of the site's URLs: the mod is /gtasanandreas/mods/3203 and its
-# main file is file 4578 ("Renewed120 V0.6"); the API ids are (game 955 << 32) + those numbers.
+# The mod's id below is the API's own id (/gtasanandreas/mods/3203 on the site). The main file is found from one of its
+# versions as the site numbers it (4578, "Renewed120 V0.6", file_id= in its download link): the API's file id is not
+# shown on the site.
 
 name: Nexus Mods
 
@@ -34,7 +35,7 @@ jobs:
     env:
       TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event.release.tag_name }}
       NEXUS_MOD_ID: '4101693770883'
-      NEXUS_FILE_ID: '4101693772258'
+      NEXUS_FILE_VERSION: '4578'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -70,12 +71,22 @@ jobs:
           fi
           { echo "text<<NEXUS_NOTES_END"; echo "$notes"; echo "NEXUS_NOTES_END"; } >> "$GITHUB_OUTPUT"
 
+      - name: Find the main file on Nexus
+        id: file
+        env:
+          NEXUS_KEY: ${{ secrets.NEXUSMODS }}
+        run: |
+          id=$(curl -sf -H "apikey: $NEXUS_KEY" -H "User-Agent: Renewed120-release"             "https://api.nexusmods.com/v3/games/gtasanandreas/mod-file-versions/$NEXUS_FILE_VERSION" | jq -r '.data.file.id')
+          if [ -z "$id" ] || [ "$id" = "null" ]; then echo "file of version $NEXUS_FILE_VERSION not found"; exit 1; fi
+          echo "main file: $id"
+          echo "id=$id" >> "$GITHUB_OUTPUT"
+
       - name: Upload to Nexus Mods
         uses: Nexus-Mods/upload-action@98532f7670c27cbecc78fae03fa3e278147827e2   # v1.0.0-beta.11
         with:
           api_key: ${{ secrets.NEXUSMODS }}
           mod_id: ${{ env.NEXUS_MOD_ID }}
-          file_id: ${{ env.NEXUS_FILE_ID }}
+          file_id: ${{ steps.file.outputs.id }}
           filename: ${{ env.ZIP }}
           version: ${{ env.VERSION }}
           display_name: ${{ env.PRE && 'Renewed120 (test version)' || 'Renewed120' }}
