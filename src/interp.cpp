@@ -39,6 +39,7 @@ struct Slot {
 };
 
 constexpr int MaxPed = 512, MaxVeh = 512, MaxObj = 1024;
+bool g_poolOverflow = false;   // a pool of the game is larger (limit adjuster)
 Slot g_ped[MaxPed], g_veh[MaxVeh], g_obj[MaxObj];
 
 // Child frames of a clump (wheels, doors, parts of cutscene objects): animated by the game once per tick.
@@ -315,6 +316,7 @@ void SnapshotPool(uintptr_t poolAddr, uintptr_t stride, Slot* slots, int maxSlot
     PoolView v{};
     if (!GetPool(poolAddr, v)) { for (int i = 0; i < maxSlots; ++i) slots[i].valid = false; return; }
     const int n = v.size < maxSlots ? v.size : maxSlots;
+    if (v.size > maxSlots) g_poolOverflow = true;
     for (int i = 0; i < n; ++i) {
         Slot& s = slots[i];
         uint8_t flag = 0x80;
@@ -611,12 +613,45 @@ float g_camStep = 0.0f, g_camPrevU[3] = {0, 0, 0};
 // Roll back only plain data (floats, small ints). Pointer-like values (lists, sub-objects that the game may have
 // created or freed in the meantime) are left alone: rolling those back crashes the game later.
 bool LooksLikePointer(uint32_t v) { return v >= 0x10000u && v < 0x3A000000u; }
+
+// That test only knows pointers below 0x3A000000 (above, the same bits are ordinary floats). Once the game uses more
+// than ~930 MB of address space (DXVK, limit adjusters, big streaming memory) real pointers are above it and would be
+// rolled back like numbers. So the fields that hold pointers are learned, per class (vtable): a field whose non-zero
+// values always had the shape of an address (4-byte aligned, inside the user address space, not a "round" float such
+// as 1.0 = 0x3F800000) over a few thousand looks is a pointer field and is never rolled back. One value of another
+// shape (a negative or unaligned float, a small int, -1) marks it as plain data for good.
+constexpr int MaxFields = STRIDE_Veh / 4, MaxClasses = 24;
+constexpr uint16_t PtrFieldLooks = 2000;
+struct FieldTypes { uintptr_t vt; uint16_t ptrLooks[MaxFields]; bool data[MaxFields]; };
+FieldTypes g_fieldTypes[MaxClasses];   // all zero at start
+FieldTypes* TypesFor(uintptr_t vt, bool add) {
+    if (!vt) return nullptr;
+    for (auto& t : g_fieldTypes) {
+        if (t.vt == vt) return &t;
+        if (!t.vt) { if (!add) return nullptr; t.vt = vt; return &t; }
+    }
+    return nullptr;
+}
+bool AddressShaped(uint32_t v) { return v >= 0x10000u && v < 0x80000000u && (v & 3u) == 0 && (v & 0xFFFu) != 0; }
+void LearnFields(const uint8_t* saved, size_t size) {
+    const auto* s = reinterpret_cast<const uint32_t*>(saved);
+    FieldTypes* t = TypesFor(s[0], true);
+    if (!t) return;
+    for (size_t i = 1; i < size / 4 && i < size_t(MaxFields); ++i) {
+        const uint32_t v = s[i];
+        if (!v || t->data[i]) continue;
+        if (!AddressShaped(v)) t->data[i] = true;
+        else if (t->ptrLooks[i] < PtrFieldLooks) ++t->ptrLooks[i];
+    }
+}
 void RestoreScalars(void* dst, const uint8_t* saved, size_t size) {
     auto* d = static_cast<uint32_t*>(dst);
     const auto* s = reinterpret_cast<const uint32_t*>(saved);
+    const FieldTypes* t = TypesFor(s[0], false);
     for (size_t i = 0; i < size / 4; ++i) {
         const uint32_t now = d[i], old = s[i];
         if (now == old || LooksLikePointer(now) || LooksLikePointer(old)) continue;
+        if (t && i < size_t(MaxFields) && !t->data[i] && t->ptrLooks[i] >= PtrFieldLooks) continue;   // a learned pointer field
         d[i] = old;
     }
 }
@@ -655,12 +690,15 @@ void RestoreMat(uintptr_t ent, const uint8_t* src, uint8_t* ptr) {
 }
 template <size_t Size>
 void SaveAll(const Slot* slots, int n, uint8_t (*save)[Size], bool* saved, uint8_t (*mat)[0x40], uint8_t** matPtr) {
+    static unsigned calls = 0;
+    const bool learn = (++calls % 6) == 0;   // about once per tick is enough
     for (int i = 0; i < n; ++i) {
         saved[i] = false;
         if (!slots[i].valid) continue;
         SaveMat(slots[i].ent, mat[i], matPtr[i]);
         __try { std::memcpy(save[i], reinterpret_cast<void*>(slots[i].ent), Size); saved[i] = true; }
         __except (EXCEPTION_EXECUTE_HANDLER) {}
+        if (saved[i] && learn) LearnFields(save[i], Size);
     }
 }
 template <size_t Size>
@@ -685,6 +723,7 @@ double NowUs() {
     return double(q.QuadPart) * 1e6 / double(fq.QuadPart);
 }
 
+bool PoolOverflow() { return g_poolOverflow; }
 void SetVehicleParts(bool on) { g_vehParts = on; }
 bool VehicleParts() { return g_vehParts; }
 void SetPedSkeleton(bool on) { g_pedSkeleton = on; }

@@ -67,6 +67,8 @@ int            g_fpsCap = 0;      // effective render cap (0 = none)
 int            g_fpsCapSetting = 0;   // ini/menu value: -1 = off, 0 = auto (monitor refresh rate), > 0 = fixed
 void*          g_d3d = nullptr;       // our own IDirect3D9, used only to query modes
 int            g_forceHz = 0;
+bool           g_vsync = false;    // wait for the monitor's refresh at each Present (no tearing)
+int            g_monitorHz = 60;
 int            g_windowMode = 1;   // 0 = exclusive fullscreen, 1 = borderless windowed fullscreen
 int            g_backW = 1920, g_backH = 1080;
 unsigned       g_presentCount = 0;
@@ -94,7 +96,9 @@ int MonitorHz(HWND wnd) {
 HWND g_gameWnd = nullptr;
 void ApplyFpsCap(HWND wnd) {
     const int before = g_fpsCap;
-    g_fpsCap = g_fpsCapSetting > 0 ? g_fpsCapSetting : (g_fpsCapSetting == 0 ? MonitorHz(wnd) : 0);
+    g_monitorHz = MonitorHz(wnd);
+    g_fpsCap = g_fpsCapSetting > 0 ? g_fpsCapSetting : (g_fpsCapSetting == 0 && !g_vsync ? g_monitorHz : 0);   // auto + VSync: VSync paces
+    if (g_vsync && g_fpsCap >= g_monitorHz) g_fpsCap = 0;   // VSync already holds that rate: two pacers would fight
     if (g_fpsCap != before) Log("render cap: %d fps (setting %d)", g_fpsCap, g_fpsCapSetting);
 }
 
@@ -225,10 +229,15 @@ unsigned g_ticks = 0;
 // (see LimitFrame), so the scheduled time is known in advance: blending for it instead of "now" removes the
 // uneven steps of tick frames (they start later because the simulation runs first, but are shown on schedule).
 LONGLONG g_nextPresentQpc = 0;
-LONGLONG FrameQpc() {
+LONGLONG FrameQpcNow() {
     LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    return (g_fpsCap > 0 && g_nextPresentQpc > now.QuadPart - g_tickPeriodQpc) ? g_nextPresentQpc : now.QuadPart;
+    return ((g_fpsCap > 0 || g_vsync) && g_nextPresentQpc > now.QuadPart - g_tickPeriodQpc) ? g_nextPresentQpc : now.QuadPart;
 }
+// One time for the whole frame, taken when it starts (HookedTimerUpdate): without a frame cap or VSync the time was
+// read again at every use, so the entities, the camera, the skeletons and the effects of one frame were each blended
+// for a slightly later moment (the car shook against the camera when the frame took longer to build).
+LONGLONG g_frameQpc = 0;
+LONGLONG FrameQpc() { return g_frameQpc ? g_frameQpc : FrameQpcNow(); }
 float TickAlpha() {
     const double a = double(FrameQpc() - g_lastTickQpc) / double(g_tickPeriodQpc);
     return a < 0.0 ? 0.0f : (a > 1.0 ? 1.0f : float(a));
@@ -310,7 +319,9 @@ bool     g_smoothClock = true;
 bool     g_smoothFog = true;     // see HookedMovingFog
 uint32_t g_tickMs = 0, g_lastTickTimeMs = 0;   // game ms the last tick advanced the clock by
 uint32_t ClockAheadMs() {
-    if (!g_smoothClock || g_logicHz <= 0 || !g_renderOnly || *reinterpret_cast<const uint8_t*>(ADDR_MenuActive)) return 0;
+    // on the tick frame too: it is shown a little after the tick like the others (it stayed at the tick's time: one
+    // short step then one long step of the waves, pickups and wings, 30 times a second)
+    if (!g_smoothClock || g_logicHz <= 0 || *reinterpret_cast<const uint8_t*>(ADDR_MenuActive)) return 0;
     const float a = TickAlpha();
     return uint32_t(float(g_tickMs) * a);
 }
@@ -571,6 +582,7 @@ void RestoreFov();
 void RestoreTheCamera();
 void __cdecl HookedTimerUpdate() {
     static LARGE_INTEGER freq, nextTick;
+    g_frameQpc = FrameQpcNow();   // the time this frame is blended for, everywhere
     if (g_logicHz <= 0) { g_origTimerUpdate(); return; }   // split disabled after a partial hook failure
     if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
     const uint8_t menu = *reinterpret_cast<volatile uint8_t*>(ADDR_MenuActive);
@@ -579,11 +591,10 @@ void __cdecl HookedTimerUpdate() {
 
     // Menus/loading always run the full original path.
     bool tick = menu != 0 || nextTick.QuadPart == 0;
-    // Otherwise tick when the next logic step is due (half a render frame of tolerance).
-    if (!tick) {
-        const LONGLONG tol = g_fpsCap > 0 ? freq.QuadPart / g_fpsCap / 2 : 0;
-        tick = now.QuadPart + tol >= nextTick.QuadPart;
-    }
+    // Otherwise tick when the next logic step is due at the time this frame is shown. (No tolerance: a tick run up
+    // to half a frame early showed its frame at "alpha 0" while it stood a little before the tick: one step of 1.5
+    // frames then one of 0.5, for as long as the frame and tick schedules stayed that close.)
+    if (!tick) tick = now.QuadPart >= nextTick.QuadPart;
     if (tick) {
         // Keep a fixed schedule; resync after hitches instead of fast-forwarding.
         const LONGLONG sched = (nextTick.QuadPart == 0 || menu || now.QuadPart > nextTick.QuadPart + 2 * period)
@@ -919,12 +930,64 @@ bool HookAddParticle() {
 
 constexpr uintptr_t ADDR_LoadRequestedModels = 0x40E3A0, ADDR_GameState = 0xC8D4C0;   // gGameState: 9 = playing
 bool g_streamEveryFrame = true;
+
+// ---- lights and shadows added by the simulation -------------------------------------------------------------------
+// Idle empties the list of point lights on every drawn frame (CPointLights::NumLights = 0 at 0x53E977) and the shadow
+// renderer empties the list of shadows to draw (CShadows::ShadowsStoredToBeRendered) after drawing it. What the
+// simulation adds to them (CPointLights::AddLight 0x7000E0 from fires, explosions, gunshots and scripts;
+// CShadows::StoreShadowToBeRendered 0x707390 from scripts) was only there on the tick frame: one drawn frame out of
+// six at 180 fps. The entries added during a tick are kept and put back at the start of each frame drawn before the
+// next one (those added from PreRender are added again on every frame by the game itself).
+constexpr uintptr_t ADDR_NumPointLights = 0xC3F0D0, ADDR_PointLights = 0xC3F0E0;       // uint32; 32 x 0x30
+constexpr uintptr_t ADDR_NumStoredShadows = 0xC403DC, ADDR_StoredShadows = 0xC40430;   // uint16; 48 x 0x34
+constexpr uint32_t MaxPointLights = 32, PointLightSize = 0x30, MaxStoredShadows = 48, StoredShadowSize = 0x34;
+bool g_tickLights = true;
+uint8_t g_keptLights[MaxPointLights * PointLightSize], g_keptShadows[MaxStoredShadows * StoredShadowSize];
+uint32_t g_keptLightCount = 0, g_keptShadowCount = 0, g_lightsBefore = 0, g_shadowsBefore = 0;
+bool TickLightsOn() {
+    return g_tickLights && *reinterpret_cast<const int*>(ADDR_GameState) == 9 && !*reinterpret_cast<const uint8_t*>(ADDR_MenuActive);
+}
+void BeginTickLights() {
+    g_lightsBefore = *reinterpret_cast<const uint32_t*>(ADDR_NumPointLights);
+    g_shadowsBefore = *reinterpret_cast<const uint16_t*>(ADDR_NumStoredShadows);
+}
+void CaptureTickLights() {
+    g_keptLightCount = g_keptShadowCount = 0;
+    if (!TickLightsOn()) return;
+    const uint32_t lights = *reinterpret_cast<const uint32_t*>(ADDR_NumPointLights);
+    const uint32_t shadows = *reinterpret_cast<const uint16_t*>(ADDR_NumStoredShadows);
+    if (lights <= MaxPointLights && lights > g_lightsBefore) {
+        g_keptLightCount = lights - g_lightsBefore;
+        std::memcpy(g_keptLights, reinterpret_cast<const void*>(ADDR_PointLights + g_lightsBefore * PointLightSize), g_keptLightCount * PointLightSize);
+    }
+    if (shadows <= MaxStoredShadows && shadows > g_shadowsBefore) {
+        g_keptShadowCount = shadows - g_shadowsBefore;
+        std::memcpy(g_keptShadows, reinterpret_cast<const void*>(ADDR_StoredShadows + g_shadowsBefore * StoredShadowSize), g_keptShadowCount * StoredShadowSize);
+    }
+}
+void ReplayTickLights() {
+    if (!TickLightsOn()) { g_keptLightCount = g_keptShadowCount = 0; return; }
+    uint32_t& lights = *reinterpret_cast<uint32_t*>(ADDR_NumPointLights);
+    if (g_keptLightCount && lights <= MaxPointLights) {
+        const uint32_t n = g_keptLightCount < MaxPointLights - lights ? g_keptLightCount : MaxPointLights - lights;
+        std::memcpy(reinterpret_cast<void*>(ADDR_PointLights + lights * PointLightSize), g_keptLights, n * PointLightSize);
+        lights += n;
+    }
+    uint16_t& shadows = *reinterpret_cast<uint16_t*>(ADDR_NumStoredShadows);
+    if (g_keptShadowCount && shadows <= MaxStoredShadows) {
+        const uint32_t n = g_keptShadowCount < MaxStoredShadows - shadows ? g_keptShadowCount : MaxStoredShadows - shadows;
+        std::memcpy(reinterpret_cast<void*>(ADDR_StoredShadows + shadows * StoredShadowSize), g_keptShadows, n * StoredShadowSize);
+        shadows = static_cast<uint16_t>(shadows + n);
+    }
+}
+
 void __cdecl HookedGameProcess() {
     if (g_logicHz > 0 && g_renderOnly) {
         // only in the running game (gGameState 9), never in the pause/main menu (FrontEndMenuManager.m_bMenuActive)
         Telemetry::Stamp(Telemetry::M_LogicStart);
         if (g_streamEveryFrame && *reinterpret_cast<const int*>(ADDR_GameState) == 9 && !*reinterpret_cast<const uint8_t*>(ADDR_MenuActive))
             reinterpret_cast<VoidFn>(ADDR_LoadRequestedModels)();
+        ReplayTickLights();
         Telemetry::Stamp(Telemetry::M_LogicEnd);
         return;
     }
@@ -932,13 +995,19 @@ void __cdecl HookedGameProcess() {
     const double t0 = Interp::NowUs();
     if (!g_smoothSparks) ReleaseParticles(1.0f, true);   // switched off: nothing left waiting
     g_inTick = true;
+    BeginTickLights();
     g_origGameProcess();
     RestoreWaterCounter();   // CGame::Process ends with a jump to the water function
+    CaptureTickLights();
     g_inTick = false;
     ++g_prtTick;
     OnTickSun();
     const double t1 = Interp::NowUs();
     if (g_interpolate) Interp::OnTick();
+    if (Interp::PoolOverflow()) {
+        static bool warned = false;
+        if (!warned) { warned = true; Log("a ped, vehicle or object pool is larger than the blend tables (limit adjuster): the entities beyond them move at the logic rate"); }
+    }
     const double t2 = Interp::NowUs();
     Interp::g_timing.processUs += t1 - t0;
     Interp::g_timing.onTickUs += t2 - t1;
@@ -1731,17 +1800,43 @@ HRESULT WINAPI HookedPresent(void* dev, const RECT* src, const RECT* dst, HWND w
     LimitFrame();   // before Present: the frame is shown at its scheduled time (see FrameQpc)
     Telemetry::Stamp(Telemetry::M_WaitEnd);
     const HRESULT hr = g_origPresent(dev, src, dst, wnd, dirty);
+    if (g_vsync && g_fpsCap <= 0) {
+        // VSync paces the frames: each one is shown one refresh after the previous. The next frame is blended for that
+        // moment on an even grid of refreshes (not "now" when it starts: tick frames start later, the simulation runs
+        // first, but are shown on the same beat), pulled gently towards the real Present times so it never drifts.
+        static LARGE_INTEGER freq;
+        if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+        LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        const LONGLONG period = freq.QuadPart / (g_monitorHz > 0 ? g_monitorHz : 60);
+        LONGLONG next = g_nextPresentQpc + period;
+        const LONGLONG target = now.QuadPart + period;
+        if (next < now.QuadPart || next > target + 2 * period) next = target;   // fell behind (hitch, loading) or ran ahead
+        else next += (target - next) / 32;
+        g_nextPresentQpc = next;
+    }
     Telemetry::EndFrame(!g_renderOnly, *reinterpret_cast<const int*>(ADDR_GameState) == 9 &&
                                            !*reinterpret_cast<const volatile uint8_t*>(ADDR_MenuActive));
     return hr;
 }
 
+// The game's window (RsGlobal.ps->window: [[0xC17054]]), null before the game made it.
+HWND GameWindow() {
+    const uintptr_t ps = *reinterpret_cast<const uintptr_t*>(0xC17054);
+    return ps ? *reinterpret_cast<const HWND*>(ps) : nullptr;
+}
+
 HRESULT WINAPI HookedCreateDevice(void* d3d, UINT adapter, UINT type, HWND wnd, DWORD flags,
                                   PresentParams* pp, void** outDev) {
-    Fix(adapter, pp, "CreateDevice");
-    if (wnd) { g_gameWnd = wnd; ApplyFpsCap(wnd); }
+    // another mod's own device (e.g. a dummy one on a hidden window to find the D3D9 functions): left as it is,
+    // and its window must not become "the game window" (F9 menu focus, borderless style, refresh rate)
+    const HWND devWnd = wnd ? wnd : (pp ? pp->hDeviceWindow : nullptr), game = GameWindow();
+    const bool ours = !game || devWnd == game;
+    if (ours) {
+        Fix(adapter, pp, "CreateDevice");
+        if (wnd) { g_gameWnd = wnd; ApplyFpsCap(wnd); }
+    } else Log("CreateDevice on another window (%p, not the game's %p): left as it is", devWnd, game);
     HRESULT hr = g_origCreateDevice(d3d, adapter, type, wnd, flags, pp, outDev);
-    if (hr == 0 && pp) ApplyBorderless(pp->hDeviceWindow ? pp->hDeviceWindow : wnd, pp);
+    if (ours && hr == 0 && pp) ApplyBorderless(pp->hDeviceWindow ? pp->hDeviceWindow : wnd, pp);
     if (hr == 0 && outDev && *outDev && !g_origReset) {
         if (!PatchVTable(*outDev, VT_Reset, reinterpret_cast<void*>(&HookedReset),
                          reinterpret_cast<void**>(&g_origReset)))
@@ -1769,6 +1864,19 @@ void Init(HMODULE self) {
     g_fixRefresh = GetPrivateProfileIntW(L"Renewed120", L"RefreshRateFix", 1, ini) != 0;
     g_telemetry = GetPrivateProfileIntW(L"Renewed120", L"Telemetry", 0, ini) != 0;
     g_fpsCapSetting = static_cast<int>(GetPrivateProfileIntW(L"Renewed120", L"FpsCap", 0, ini));
+    g_vsync = GetPrivateProfileIntW(L"Renewed120", L"VSync", 0, ini) != 0;
+    if (g_vsync) {
+        // psCameraShowRaster (0x745240) asks RwCameraShowRaster for rwRASTERFLIPWAITVSYNC only when the frame limiter
+        // (0xBA6794) or 0xBAB318 is on: "push 0" at 0x745252 -> "push 1", so RenderWare itself sets the D3D present
+        // interval to one (setting it behind its back makes it reset the device on every frame)
+        uint8_t* p = reinterpret_cast<uint8_t*>(0x745252);
+        DWORD old;
+        if (p[0] == 0x6A && p[1] == 0x00 && VirtualProtect(p, 2, PAGE_EXECUTE_READWRITE, &old)) {
+            p[1] = 0x01;
+            VirtualProtect(p, 2, old, &old);
+            Log("VSync: on");
+        } else { Log("VSync: unexpected code at 0x745252, off"); g_vsync = false; }
+    } else Log("VSync: off");
     ApplyFpsCap(nullptr);
     g_logicHz = static_cast<int>(GetPrivateProfileIntW(L"Renewed120", L"LogicHz", 30, ini));
     if (g_logicHz < 0 || g_logicHz > 60) g_logicHz = 0;
@@ -1823,6 +1931,8 @@ void Init(HMODULE self) {
         Log("car shadow per-frame patch installed (enabled=%d)", int(g_smoothCarShadows));
     }
     g_staticFix = GetPrivateProfileIntW(L"Renewed120", L"StaticShadowFix", 1, ini) != 0;
+    g_tickLights = GetPrivateProfileIntW(L"Renewed120", L"LightsEveryFrame", 1, ini) != 0;
+    Log("lights and shadows of the simulation kept on every frame: %d", int(g_tickLights));
     if (g_logicHz > 0 &&
         HookCall(SITE_UpdStatic1, reinterpret_cast<void*>(&HookedUpdStatic1), reinterpret_cast<void**>(&g_origUpdStatic1), EXPECT_UpdStatic) &&
         HookCall(SITE_UpdStatic2, reinterpret_cast<void*>(&HookedUpdStatic2), reinterpret_cast<void**>(&g_origUpdStatic2), EXPECT_UpdStatic))

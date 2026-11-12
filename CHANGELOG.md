@@ -1,5 +1,32 @@
 # Changelog
 
+## v0.7
+
+VSync, and a pass over the timing of the drawn frames.
+
+### Added
+- **VSync** (`VSync=1`): no tearing. With `FpsCap=0` or `-1` the frame rate follows the monitor. It goes through the
+  game's own setting, in borderless and exclusive fullscreen.
+- `LightsEveryFrame`: see below.
+
+### Fixed
+- **Lights of fires, explosions and gunshots**, and the lights and shadows drawn by mission scripts, were only there
+  on one drawn frame per simulation step (one out of six at 180 fps): they are kept on every frame.
+- **Small shake of the car against the camera** without a frame cap: everything in a frame is now blended for the
+  same moment (the time was read again at each step of the frame).
+- **Waves, pickups and birds** took one short step then one long step 30 times a second: the frame of the simulation
+  step is moved ahead like the others.
+- **Uneven steps with a frame cap** when the frame and simulation schedules were close: the simulation step could
+  run half a frame early.
+- With VSync, each frame is blended for the refresh it is shown on (frames of a simulation step were blended late).
+- With VSync, a frame cap at or above the monitor's rate is ignored (two pacers fought each other).
+- **Developer menu (F9) not opening** when another mod creates its own hidden Direct3D device (controller mods...):
+  that window was taken for the game's.
+- The log says so when a limit adjuster makes a pool larger than what the mod blends.
+- **Physics guard** (vehicles and peds kept untouched by the extra frames): it told pointers from numbers by their
+  value alone, which stops working once the game uses a lot of memory (DXVK, limit adjusters). It now learns which
+  fields hold pointers and never puts those back.
+
 ## v0.6
 
 More things that still moved at 30 fps, and a crash when loading a save.
