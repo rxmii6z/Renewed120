@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdint>
 
 // Render-time interpolation of entities and the camera (GTA SA 1.0 US).
 // The game simulates at a fixed rate (see LogicHz); between two simulation ticks we show a blend of
@@ -42,4 +43,7 @@ void Restore();
 void Reset();
 // The camera is not blended any more (or is again): nothing kept from before.
 void ForgetCamera();
+void NoteShownByCamera(uintptr_t ent);   // the camera turned this ped: not another mod
+void KeepShownPlayerSkeleton();   // before the tick: the player's skeleton as last shown
+bool SwapShownPlayerSkeleton();   // swap it in / out (call twice)
 }
