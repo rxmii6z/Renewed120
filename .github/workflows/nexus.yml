@@ -4,7 +4,7 @@
 # event: pre-releases do not send it), or by hand from the Actions tab with a tag (to retry, or to send a
 # pre-release anyway).
 #
-# Needs the secret NEXUSMODS_API_KEY in the repository settings (Settings > Secrets and variables > Actions): the API
+# Needs the secret NEXUSMODS in the repository settings (Settings > Secrets and variables > Actions): the API
 # key of the Nexus account (nexusmods.com > Settings > API Keys).
 #
 # The ids below are the API's own ids, not the numbers of the site's URLs: the mod is /gtasanandreas/mods/3203 and its
@@ -73,7 +73,7 @@ jobs:
       - name: Upload to Nexus Mods
         uses: Nexus-Mods/upload-action@98532f7670c27cbecc78fae03fa3e278147827e2   # v1.0.0-beta.11
         with:
-          api_key: ${{ secrets.NEXUSMODS_API_KEY }}
+          api_key: ${{ secrets.NEXUSMODS }}
           mod_id: ${{ env.NEXUS_MOD_ID }}
           file_id: ${{ env.NEXUS_FILE_ID }}
           filename: ${{ env.ZIP }}
