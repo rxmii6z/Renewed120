@@ -156,6 +156,17 @@ bool IsCutsceneObject(uintptr_t ent) {
     __try { return *reinterpret_cast<const uintptr_t*>(ent) == VT_CutsceneObject; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+// An object that plays an animation (the basketball, animated props): a clump whose animation data is set up
+// (RpAnimBlendClumpIsInitialized, 0x4D6760). Its animation moves child frames of the clump once per tick, like the
+// parts of a cutscene object.
+bool IsAnimatedClump(uintptr_t ent) {
+    __try {
+        void* clump = *reinterpret_cast<void**>(ent + OFF_EntRwObject);
+        if (!clump || *static_cast<const uint8_t*>(clump) != 2) return false;   // RwObject::type, rpCLUMP = 2
+        return reinterpret_cast<int(__cdecl*)(void*)>(0x4D6760)(clump) != 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 // ---- bones (child frames) ------------------------------------------------------------------
 // Depth-first walk of the frame tree below `root` (the root itself is handled through the CMatrix).
 bool CollectBones(void* root, void** frames, Pose* poses, int& n) {
@@ -502,8 +513,9 @@ void UpdatePedHierarchies(bool tickFrame, float alpha) {
 }
 
 // ---- cutscenes ---------------------------------------------------------------------------------
-// Objects with a skeleton (cutscene characters) and cutscene objects without one (props: their animation moves
-// child frames of the clump): a few of them, found again on each tick.
+// Objects with a skeleton (cutscene characters) and objects without one that are animated (cutscene props, and any
+// object playing an animation in the game, such as the basketball: the animation moves child frames of the clump):
+// a few of them, found again on each tick.
 constexpr int MaxCs = 48;
 struct CsEntry { bool used; int slot; uintptr_t ent; bool skinned; HierSet h; BoneSet b; };   // all zero at start: kept out of the .asi file
 CsEntry g_cs[MaxCs];
@@ -523,7 +535,7 @@ void FindCutsceneObjects() {
         if (!g_obj[i].valid || taken[i]) continue;
         void* h = nullptr; uint8_t* m = nullptr; int n = 0;
         const bool skinned = GetHier(g_obj[i].ent, h, m, n);
-        if (!skinned && !IsCutsceneObject(g_obj[i].ent)) continue;
+        if (!skinned && !IsCutsceneObject(g_obj[i].ent) && !IsAnimatedClump(g_obj[i].ent)) continue;
         CsEntry* free = nullptr;
         for (auto& c : g_cs) if (!c.used) { free = &c; break; }
         if (!free) break;
@@ -724,6 +736,7 @@ double NowUs() {
 }
 
 bool PoolOverflow() { return g_poolOverflow; }
+void ForgetCamera() { g_cam.valid = g_cam.applied = false; }
 void SetVehicleParts(bool on) { g_vehParts = on; }
 bool VehicleParts() { return g_vehParts; }
 void SetPedSkeleton(bool on) { g_pedSkeleton = on; }

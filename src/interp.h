@@ -40,4 +40,6 @@ void RestoreVehicles();
 void Restore();
 // Menu open (a save may be loaded): forget every entity, skeleton and part kept for the blend.
 void Reset();
+// The camera is not blended any more (or is again): nothing kept from before.
+void ForgetCamera();
 }
