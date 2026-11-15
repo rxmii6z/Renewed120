@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.81
+
+Two fixes found after v0.8.
+
+### Fixed
+- **Car camera slow to swing back behind the vehicle** with the camera on every frame: after a turn it came round
+  about 3.6 times too slowly at 180 fps and had to be helped with the mouse. The game turns the angle the camera wants
+  this step into a turn speed by dividing it by the time step, but never by less than 1: right at 30 fps, too small
+  when the camera runs on every drawn frame. The camera behind CJ on foot swung back too slowly for the same reason.
+- **CJ's arms shaking on a bicycle**: the game bends his arms so his hands hold the handlebar once per simulation
+  step. Between steps the arms went back to the animation's pose (up to 10 cm away when riding), 30 times a second.
+  The hands are now put on the handlebar on every drawn frame.
+
 ## v0.8
 
 The camera on every frame is now on by default, with the fixes found since v0.7.
