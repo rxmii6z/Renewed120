@@ -2,7 +2,12 @@
 
 ## v0.8
 
-Fixes for the camera on every frame (`CameraEveryFrame=1`) found since v0.7. Nothing changes with the default settings.
+The camera on every frame is now on by default, with the fixes found since v0.7.
+
+### Changed
+- **Camera on every frame on by default** (`CameraEveryFrame=1`, no longer experimental): the view answers the mouse or
+  the stick on the next drawn frame instead of one simulation step late (33 ms). Set `CameraEveryFrame=0` in
+  `Renewed120.ini` (or turn it off in the developer menu, F9) to get the blended camera of v0.6 back.
 
 ### Fixed
 - **Aiming with a pistol, Uzi, Tec-9 or sawn-off**: CJ kept facing one way while the camera turned, and walking while
