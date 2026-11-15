@@ -1956,6 +1956,34 @@ void __fastcall HookedClimbTarget(void* task, void* edx, void* ped, float* out) 
     for (int k = 0; k < 3; ++k) out[k] = m[12 + k] + (out[k] - m[12 + k]) * w;
 }
 
+// The cameras behind CJ and behind a vehicle swing round to his heading / the way the vehicle goes. Each run, they
+// turn the angle they want this step (target - beta, a step in proportion to the time step) into a turn speed by
+// dividing it by max(1, CTimer::ms_fTimeStep): by the time step at 30 fps (1.67), but by 1 above 50 fps. Run on every
+// drawn frame (time step 0.28 at 180 fps) the camera came round 3.6 times too slowly and had to be helped with the
+// mouse. The 1.0 of that max() is read from here instead: 1 for the game's own runs, a floor of 0.01 on the drawn
+// frames, so the speed is the step divided by the time step at any frame rate.
+// Process_FollowPed_SA 0x52381D/0x523830, Process_FollowCar_SA 0x524FD7/0x524FEA, its sibling at 0x525E50
+// (0x5262C1/0x5262D4): "fld dword ptr [0x858624]" (1.0) on both sides of "fcomp [0xB7CB5C]".
+constexpr uintptr_t SITE_CamMinStep[6] = {0x52381D, 0x523830, 0x524FD7, 0x524FEA, 0x5262C1, 0x5262D4};
+float g_camMinStep = 1.0f;
+bool PatchCamMinStep() {
+    const uint8_t expect[6] = {0xD9, 0x05, 0x24, 0x86, 0x85, 0x00};   // fld dword ptr [0x858624]
+    for (uintptr_t site : SITE_CamMinStep)
+        if (std::memcmp(reinterpret_cast<const void*>(site), expect, 6) != 0) {
+            Log("camera turn speed patch: unexpected code at %08X, skipped", unsigned(site));
+            return false;
+        }
+    for (uintptr_t site : SITE_CamMinStep) {
+        auto* p = reinterpret_cast<uint8_t*>(site);
+        DWORD old;
+        if (!VirtualProtect(p, 6, PAGE_EXECUTE_READWRITE, &old)) return false;
+        *reinterpret_cast<float**>(p + 2) = &g_camMinStep;
+        VirtualProtect(p, 6, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), p, 6);
+    }
+    return true;
+}
+
 void CameraEveryFrame() {
     const bool live = g_camOwed && CamFrameWanted();
     if (live != g_camLive) {   // from the blend to the live camera or back: nothing kept from the other way
@@ -2008,7 +2036,9 @@ void CameraEveryFrame() {
         std::memcpy(shownPos, playerPos, sizeof shownPos);
         if (!Interp::RealPosition(player, playerPos)) playerPos = nullptr;
     }
+    g_camMinStep = 0.01f;
     { ClockShift shift; g_origCameraProcess(reinterpret_cast<void*>(ADDR_TheCamera), nullptr); }
+    g_camMinStep = 1.0f;
     if (playerPos) std::memcpy(playerPos, shownPos, sizeof shownPos);
     g_climbEase = false;
     if (climbTime) *climbTime = climbReal;
@@ -2069,6 +2099,35 @@ VoidFn g_origPedsAfterPreRender = nullptr;
 void __cdecl HookedPedsAfterPreRender() {
     if (g_interpolate && !g_hierDone) { Interp::ApplyHierarchies(!g_renderOnly, TickAlpha()); g_hierDone = true; }
     g_origPedsAfterPreRender();
+}
+// Hands of a cyclist: CBmx::ProcessDrivingAnims (0x6BFB50, run by the simulation) raises two flags of the bike
+// (+0x7B4 / +0x7B5), and ProcessAfterPreRender then calls 0x6B7F90 (at 0x601B91, thiscall bike, ped; ret 4), which
+// bends the arms so the hands hold the handlebar and clears the flags. It ran once per tick: on the tick frame the arms
+// were bent onto the handlebar, on the other frames the blended skeleton had the animation's arms (2.6 cm off standing
+// still, 10 cm riding): the arms shook 30 times a second. The flags of the tick are given again on the other frames,
+// so the arms are bent onto the shown handlebar on every frame, after the blend (as the game does at its own rate).
+constexpr uintptr_t SITE_BikeHands = 0x601B91, EXPECT_BikeHands = 0x6B7F90;
+using BikeHandsFn = void(__fastcall*)(void*, void*, void*);
+BikeHandsFn g_origBikeHands = nullptr;
+struct BikeHands { uint8_t* bike; uint8_t flags[2]; };
+BikeHands g_bikeHands[16];
+int g_bikeHandsCount = 0;
+void __fastcall HookedBikeHands(void* bike, void* edx, void* ped) {
+    uint8_t* b = static_cast<uint8_t*>(bike);
+    int i = 0;
+    while (i < g_bikeHandsCount && g_bikeHands[i].bike != b) ++i;
+    if (g_renderOnly && g_logicHz > 0) {
+        if (i < g_bikeHandsCount) { b[0x7B4] = g_bikeHands[i].flags[0]; b[0x7B5] = g_bikeHands[i].flags[1]; }
+    } else {
+        if (i == g_bikeHandsCount) {
+            if (g_bikeHandsCount == 16) g_bikeHandsCount = 0;   // forget the old bikes (it is rebuilt on every tick)
+            i = g_bikeHandsCount++;
+            g_bikeHands[i].bike = b;
+        }
+        g_bikeHands[i].flags[0] = b[0x7B4];
+        g_bikeHands[i].flags[1] = b[0x7B5];
+    }
+    g_origBikeHands(bike, edx, ped);
 }
 
 char __cdecl HookedCameraBegin(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e, uint32_t f, uint32_t g) {
@@ -2263,6 +2322,8 @@ void Init(HMODULE self) {
             if (HookCall(SITE_PedsAfterPreRender, reinterpret_cast<void*>(&HookedPedsAfterPreRender),
                          reinterpret_cast<void**>(&g_origPedsAfterPreRender), EXPECT_PedsAfterPreRender))
                 Log("skeletons blended before the held props are placed");
+            if (HookCall(SITE_BikeHands, reinterpret_cast<void*>(&HookedBikeHands), reinterpret_cast<void**>(&g_origBikeHands), EXPECT_BikeHands))
+                Log("cyclist's hands put on the handlebar on every frame");
             if (HookCall(SITE_Mirrors, reinterpret_cast<void*>(&HookedMirrors), reinterpret_cast<void**>(&g_origMirrors), EXPECT_Mirrors))
                 Log("mirror camera blended");
             g_smoothFog = GetPrivateProfileIntW(L"Renewed120", L"SmoothFog", 1, ini) != 0;
@@ -2301,6 +2362,7 @@ void Init(HMODULE self) {
         if (!g_camHeadingHooks) Log("camera heading hooks failed: the aiming heading is always kept");
         if (!HookCall(SITE_ClimbTarget, reinterpret_cast<void*>(&HookedClimbTarget), reinterpret_cast<void**>(&g_origClimbTarget), EXPECT_ClimbTarget))
             Log("climb camera target hook failed: the camera jumps once when a climb starts");
+        if (!PatchCamMinStep()) Log("camera turn speed patch failed: the camera comes round behind CJ / the vehicle slowly");
     }
     g_staticFix = GetPrivateProfileIntW(L"Renewed120", L"StaticShadowFix", 1, ini) != 0;
     g_tickLights = GetPrivateProfileIntW(L"Renewed120", L"LightsEveryFrame", 1, ini) != 0;
