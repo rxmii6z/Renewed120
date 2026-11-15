@@ -2288,7 +2288,7 @@ void Init(HMODULE self) {
         SetVehShadowPatch(GetPrivateProfileIntW(L"Renewed120", L"SmoothCarShadows", 1, ini) != 0);
         Log("car shadow per-frame patch installed (enabled=%d)", int(g_smoothCarShadows));
     }
-    g_camFrame = GetPrivateProfileIntW(L"Renewed120", L"CameraEveryFrame", 0, ini) != 0;
+    g_camFrame = GetPrivateProfileIntW(L"Renewed120", L"CameraEveryFrame", 1, ini) != 0;
     if (g_logicHz > 0 &&
         HookCall(SITE_CameraProcess, reinterpret_cast<void*>(&HookedCameraProcess), reinterpret_cast<void**>(&g_origCameraProcess), EXPECT_CameraProcess) &&
         HookCall(SITE_UpdateMouse, reinterpret_cast<void*>(&HookedUpdateMouse), reinterpret_cast<void**>(&g_origUpdateMouse), EXPECT_UpdateMouse)) {
