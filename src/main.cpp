@@ -986,6 +986,7 @@ void ReplayTickLights() {
     }
 }
 
+void OnTickClimbCam();
 void __cdecl HookedGameProcess() {
     if (g_logicHz > 0 && g_renderOnly) {
         // only in the running game (gGameState 9), never in the pause/main menu (FrontEndMenuManager.m_bMenuActive)
@@ -1009,6 +1010,7 @@ void __cdecl HookedGameProcess() {
     g_inTick = false;
     ++g_prtTick;
     OnTickSun();
+    OnTickClimbCam();
     const double t1 = Interp::NowUs();
     if (g_interpolate) Interp::OnTick();
     if (Interp::PoolOverflow()) {
@@ -1875,6 +1877,19 @@ void KeepAimHeading(uintptr_t ped) {
     std::memcpy(g_aimHeading.pos, m + 12, sizeof g_aimHeading.pos);
     g_aimHeading.ped = ped; g_aimHeading.valid = true;
 }
+// The aiming cameras turn the player themselves (CPlaceable::SetHeading, 0x43E0C0) only for some weapons: in
+// CCam::Process_AimWeapon (0x521500) only when the weapon is not aimed with the arm (CWeaponInfo flag 2: pistols,
+// Uzi, Tec-9, sawn-off are) and is not a melee weapon; with the others the simulation turns him (tasks). Putting back
+// the heading of the last frame then undid every turn of the simulation: the player stayed facing one way while the
+// camera turned, and walking while aiming went wrong. It is only put back after a frame whose camera turned him.
+constexpr uintptr_t SITE_CamSetHeading[3] = {0x5226AE, 0x522C43, 0x517713}, EXPECT_SetHeading = 0x43E0C0;
+using SetHeadingFn = void(__fastcall*)(void*, void*, float);
+SetHeadingFn g_origCamSetHeading[3] = {};
+bool g_camHeadingHooks = false, g_camTurnedPlayer = false;
+template <int I> void __fastcall HookedCamSetHeading(void* self, void* edx, float h) {
+    if (reinterpret_cast<uintptr_t>(self) == *reinterpret_cast<const uintptr_t*>(ADDR_PlayerPed)) g_camTurnedPlayer = true;
+    g_origCamSetHeading[I](self, edx, h);
+}
 void PutAimHeading(uintptr_t ped) {
     if (!g_aimHeading.valid || !ped || ped != g_aimHeading.ped) return;
     const uint16_t mode = *reinterpret_cast<const uint16_t*>(ADDR_TheCamera + 0x174 + 0x238 * *reinterpret_cast<const uint8_t*>(ADDR_TheCamera + 0x59) + 0xC);
@@ -1887,6 +1902,58 @@ void PutAimHeading(uintptr_t ped) {
     if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > 4.0f) return;   // moved far (teleport...): leave it
     std::memcpy(m, g_aimHeading.mat, sizeof g_aimHeading.mat);
     std::memcpy(f + 4, g_aimHeading.frame, sizeof g_aimHeading.frame);
+}
+
+// Climbing: the camera aims at a point CTaskSimpleClimb::GetCameraTargetPos (0x67A390, called from CCamera::Process)
+// works out from the handhold and the time of the climb animation (task +0x2C: CAnimBlendAssociation, current time
+// at +0x20). That time only moves on ticks: run on every frame, the camera rose by steps 30 times a second during the
+// climb. The camera is given the blend of the last two ticks' times, like the shown entities.
+//
+// The start and the end of the climb change what the camera aims at in one step (measured): the first tick of the
+// climb swaps the player's position (the shown one, blended) for that point at the handhold, about 1 m higher and
+// further; the tick that ends it puts the player on top at once, while the blend moves the shown player up there
+// during the next tick, and the camera, aiming at the shown player again, dropped by 1 m and came back up. In the
+// original game both are one 30 fps step among the others; at a high frame rate they were one jerk. So the first tick
+// of the climb slides the aimed point from the shown player to the handhold point, and during the tick that ends it
+// the camera aims at the player's real place.
+constexpr uintptr_t ADDR_GetTaskClimb = 0x601180;   // CTask* CPedIntelligence::GetTaskClimb()  thiscall
+constexpr uintptr_t SITE_ClimbTarget = 0x5273A1, EXPECT_ClimbTarget = 0x67A390;   // in CCamera::Process
+struct ClimbCam { uintptr_t anim = 0; float prev = 0, curr = 0; bool climbing = false, starting = false, ended = false; } g_climbCam;
+uintptr_t PlayerClimbTask() {
+    __try {   // the player may be rebuilt (loading a save): never crash over a camera detail
+        const uintptr_t ped = *reinterpret_cast<const uintptr_t*>(ADDR_PlayerPed);
+        if (!ped) return 0;
+        void* intel = *reinterpret_cast<void**>(ped + 0x47C);
+        if (!intel) return 0;
+        return reinterpret_cast<uintptr_t(__thiscall*)(void*)>(ADDR_GetTaskClimb)(intel);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+uintptr_t PlayerClimbAnim() {
+    const uintptr_t task = PlayerClimbTask();
+    return task ? *reinterpret_cast<const uintptr_t*>(task + 0x2C) : 0;
+}
+void OnTickClimbCam() {
+    const uintptr_t task = g_camFrame && g_camHooks ? PlayerClimbTask() : 0;
+    g_climbCam.starting = task && !g_climbCam.climbing;
+    g_climbCam.ended = !task && g_climbCam.climbing;
+    g_climbCam.climbing = task != 0;
+    const uintptr_t anim = task ? *reinterpret_cast<const uintptr_t*>(task + 0x2C) : 0;
+    if (!anim) { g_climbCam.anim = 0; return; }
+    const float t = *reinterpret_cast<const float*>(anim + 0x20);
+    g_climbCam.prev = (anim == g_climbCam.anim && t >= g_climbCam.curr) ? g_climbCam.curr : t;   // new or restarted: no blend
+    g_climbCam.curr = t;
+    g_climbCam.anim = anim;
+}
+using ClimbTargetFn = void(__fastcall*)(void*, void*, void*, float*);
+ClimbTargetFn g_origClimbTarget = nullptr;
+bool g_climbEase = false;   // set while the drawn frames of the climb's first tick run the camera
+void __fastcall HookedClimbTarget(void* task, void* edx, void* ped, float* out) {   // CTaskSimpleClimb::GetCameraTargetPos
+    g_origClimbTarget(task, edx, ped, out);
+    if (!g_climbEase || !ped) return;
+    const float* m = PedMatrix(reinterpret_cast<uintptr_t>(ped));
+    if (!m) return;
+    const float w = TickAlpha();
+    for (int k = 0; k < 3; ++k) out[k] = m[12 + k] + (out[k] - m[12 + k]) * w;
 }
 
 void CameraEveryFrame() {
@@ -1929,9 +1996,25 @@ void CameraEveryFrame() {
     const uintptr_t player = *reinterpret_cast<const uintptr_t*>(ADDR_PlayerPed);
     PutAimHeading(player);   // every frame: the blend of the ticks' headings (rotating) is not where the camera left it
     const bool skel = tickFrame && Interp::SwapShownPlayerSkeleton();
+    g_camTurnedPlayer = false;
+    float* climbTime = g_climbCam.anim && PlayerClimbAnim() == g_climbCam.anim ? reinterpret_cast<float*>(g_climbCam.anim + 0x20) : nullptr;
+    const float climbReal = climbTime ? *climbTime : 0.0f;
+    if (climbTime) *climbTime = g_climbCam.prev + (g_climbCam.curr - g_climbCam.prev) * TickAlpha();
+    g_climbEase = g_climbCam.starting;
+    float* playerPos = g_climbCam.ended && player ? PedMatrix(player) : nullptr;
+    if (playerPos) playerPos += 12;   // CMatrix position
+    float shownPos[3] = {};
+    if (playerPos) {   // the tick that ended the climb: aim at the real place, not at the shown one rising to it
+        std::memcpy(shownPos, playerPos, sizeof shownPos);
+        if (!Interp::RealPosition(player, playerPos)) playerPos = nullptr;
+    }
     { ClockShift shift; g_origCameraProcess(reinterpret_cast<void*>(ADDR_TheCamera), nullptr); }
+    if (playerPos) std::memcpy(playerPos, shownPos, sizeof shownPos);
+    g_climbEase = false;
+    if (climbTime) *climbTime = climbReal;
     if (skel) Interp::SwapShownPlayerSkeleton();
-    KeepAimHeading(player);
+    if (g_camTurnedPlayer || !g_camHeadingHooks) KeepAimHeading(player);
+    else g_aimHeading.valid = false;   // the simulation turns him (weapon aimed with the arm): leave its heading
     if (player) Interp::NoteShownByCamera(player);
     g_camRan = true;
     step = savedStep;
@@ -2211,6 +2294,13 @@ void Init(HMODULE self) {
         HookCall(SITE_UpdateMouse, reinterpret_cast<void*>(&HookedUpdateMouse), reinterpret_cast<void**>(&g_origUpdateMouse), EXPECT_UpdateMouse)) {
         g_camHooks = true;
         Log("camera on every frame installed (enabled=%d)", int(g_camFrame));
+        g_camHeadingHooks =
+            HookCall(SITE_CamSetHeading[0], reinterpret_cast<void*>(&HookedCamSetHeading<0>), reinterpret_cast<void**>(&g_origCamSetHeading[0]), EXPECT_SetHeading) &&
+            HookCall(SITE_CamSetHeading[1], reinterpret_cast<void*>(&HookedCamSetHeading<1>), reinterpret_cast<void**>(&g_origCamSetHeading[1]), EXPECT_SetHeading) &&
+            HookCall(SITE_CamSetHeading[2], reinterpret_cast<void*>(&HookedCamSetHeading<2>), reinterpret_cast<void**>(&g_origCamSetHeading[2]), EXPECT_SetHeading);
+        if (!g_camHeadingHooks) Log("camera heading hooks failed: the aiming heading is always kept");
+        if (!HookCall(SITE_ClimbTarget, reinterpret_cast<void*>(&HookedClimbTarget), reinterpret_cast<void**>(&g_origClimbTarget), EXPECT_ClimbTarget))
+            Log("climb camera target hook failed: the camera jumps once when a climb starts");
     }
     g_staticFix = GetPrivateProfileIntW(L"Renewed120", L"StaticShadowFix", 1, ini) != 0;
     g_tickLights = GetPrivateProfileIntW(L"Renewed120", L"LightsEveryFrame", 1, ini) != 0;

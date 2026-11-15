@@ -751,6 +751,15 @@ void NoteShownByCamera(uintptr_t ent) {
     }
 }
 
+bool RealPosition(uintptr_t ped, float* pos) {
+    for (const auto& s : g_ped) {
+        if (!s.valid || s.ent != ped) continue;
+        std::memcpy(pos, s.curr.p, 12);
+        return true;
+    }
+    return false;
+}
+
 // The aiming camera (CCam::Process_AimWeapon, 0x521500) follows a bone of the player (GetBonePosition, spine 3, at
 // 0x521EDC). Run on every drawn frame (CameraEveryFrame) it reads the skeleton as the previous frame showed it, except
 // on the frame of a tick, where the game has just posed it one tick ahead: the view stepped sideways by a few

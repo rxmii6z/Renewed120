@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.8
+
+Fixes for the camera on every frame (`CameraEveryFrame=1`) found since v0.7. Nothing changes with the default settings.
+
+### Fixed
+- **Aiming with a pistol, Uzi, Tec-9 or sawn-off**: CJ kept facing one way while the camera turned, and walking while
+  aiming went wrong. With these weapons the game turns him itself (the camera only does it for weapons held at the
+  shoulder), and the fix for the aiming shake of v0.7 undid that turn on every frame.
+- **Climbing**: the camera rose by steps 30 times a second during the climb (it aims at a point that follows the
+  climb animation, which only moves on simulation steps).
+- **Climbing**: a jerk of the camera when the climb starts and when CJ gets up on top (the camera went away and came
+  back).
+- Safer while a save is loaded: the camera on every frame no longer reads the player unguarded while he is rebuilt.
+
 ## v0.7
 
 VSync, a camera without lag, the last things that still moved 30 times a second, and a pass over the timing of

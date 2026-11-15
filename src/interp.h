@@ -44,6 +44,7 @@ void Reset();
 // The camera is not blended any more (or is again): nothing kept from before.
 void ForgetCamera();
 void NoteShownByCamera(uintptr_t ent);   // the camera turned this ped: not another mod
+bool RealPosition(uintptr_t ped, float* pos);   // where the last tick left this ped (not the blended place shown)
 void KeepShownPlayerSkeleton();   // before the tick: the player's skeleton as last shown
 bool SwapShownPlayerSkeleton();   // swap it in / out (call twice)
 }
