@@ -1844,6 +1844,7 @@ void __fastcall HookedCameraProcess(void* self, void* edx) {
     g_origCameraProcess(self, edx);
     n = read;
 }
+int g_mapWheel = 0;   // wheel notches on the pause menu's map not taken yet (+ in, - out)
 void __fastcall HookedUpdateMouse(void* self, void* edx) {
     g_origUpdateMouse(self, edx);
     MouseState& n = *reinterpret_cast<MouseState*>(ADDR_NewMouse);
@@ -1852,6 +1853,22 @@ void __fastcall HookedUpdateMouse(void* self, void* edx) {
         n.z += g_mouseAcc[0]; n.x += g_mouseAcc[1]; n.y += g_mouseAcc[2];
         n.wheelUp |= uint8_t(g_mouseAccUp); n.wheelDown |= uint8_t(g_mouseAccDown);
         *reinterpret_cast<MouseState*>(ADDR_OldMouse) = g_mouseTickPrev;
+    }
+    // Map of the pause menu (FrontEndMenuManager 0xBA6748, page +0x15D == 5): CMenuManager zooms on a wheel notch
+    // (0x57764B / 0x57797E) only if more than 20 ms of CTimer::m_snTimeInMillisecondsPauseMode (0xB7CB7C) passed since
+    // 0xBA8280, which it moves to now at the end of every frame where that is so (0x578C6F). At 30 fps every frame
+    // passes; at 240 fps one in five does and the other notches were lost (the map barely zoomed). A notch is kept here
+    // until a frame that takes it, one per frame.
+    if (*reinterpret_cast<const uint8_t*>(ADDR_MenuActive) && *reinterpret_cast<const int8_t*>(0xBA6748 + 0x15D) == 5) {
+        if (n.wheelUp && g_mapWheel < 8) ++g_mapWheel;
+        if (n.wheelDown && g_mapWheel > -8) --g_mapWheel;
+        const uint32_t now = *reinterpret_cast<const uint32_t*>(0xB7CB7C), last = *reinterpret_cast<const uint32_t*>(0xBA8280);
+        n.wheelUp = n.wheelDown = 0;
+        if (g_mapWheel && now - last > 20) {
+            if (g_mapWheel > 0) { n.wheelUp = 1; --g_mapWheel; } else { n.wheelDown = 1; ++g_mapWheel; }
+        }
+    } else {
+        g_mapWheel = 0;
     }
     g_mouseHasAcc = g_mouseSub;
     g_mouseAcc[0] = g_mouseAcc[1] = g_mouseAcc[2] = 0.0f;
@@ -2130,6 +2147,33 @@ void __fastcall HookedBikeHands(void* bike, void* edx, void* ped) {
     g_origBikeHands(bike, edx, ped);
 }
 
+// Script menus (shops: clothes, Ammu-Nation, barber...): CHud::Draw (call at 0x58FCDA) runs CMenuSystem::Process
+// (0x582630, cdecl, menu id) on every drawn frame, and it reads a press as "down now, up before" (CPad New/OldState,
+// the keyboard's NewKeyState 0xB73190 / OldKeyState 0xB72F20, the mouse). Those only change on ticks: one press
+// counted on every drawn frame of its tick, the highlight raced down the list and the sound played several times.
+// On frames without a tick the menu sees "before" = "now", so a press counts once.
+constexpr uintptr_t SITE_MenuSystem = 0x58FCDA, EXPECT_MenuSystem = 0x582630;
+constexpr uintptr_t ADDR_NewKeys = 0xB73190, ADDR_OldKeys = 0xB72F20, SIZE_Keys = 0x270;
+using MenuSystemFn = void(__cdecl*)(int);
+MenuSystemFn g_origMenuSystem = nullptr;
+void __cdecl HookedMenuSystem(int id) {
+    if (!(g_renderOnly && g_logicHz > 0)) { g_origMenuSystem(id); return; }
+    uint8_t* pad = reinterpret_cast<uint8_t*>(ADDR_Pad0);
+    uint8_t* oldKeys = reinterpret_cast<uint8_t*>(ADDR_OldKeys);
+    uint8_t* oldMouse = reinterpret_cast<uint8_t*>(ADDR_OldMouse);
+    static uint8_t savePad[0x30], saveKeys[SIZE_Keys], saveMouse[sizeof(MouseState)];
+    std::memcpy(savePad, pad + 0x30, 0x30);
+    std::memcpy(saveKeys, oldKeys, SIZE_Keys);
+    std::memcpy(saveMouse, oldMouse, sizeof saveMouse);
+    std::memcpy(pad + 0x30, pad, 0x30);
+    std::memcpy(oldKeys, reinterpret_cast<const uint8_t*>(ADDR_NewKeys), SIZE_Keys);
+    std::memcpy(oldMouse, reinterpret_cast<const uint8_t*>(ADDR_NewMouse), sizeof saveMouse);
+    g_origMenuSystem(id);
+    std::memcpy(pad + 0x30, savePad, 0x30);
+    std::memcpy(oldKeys, saveKeys, SIZE_Keys);
+    std::memcpy(oldMouse, saveMouse, sizeof saveMouse);
+}
+
 char __cdecl HookedCameraBegin(uint32_t a, uint32_t b, uint32_t c, uint32_t d, uint32_t e, uint32_t f, uint32_t g) {
     const double t0 = Interp::NowUs();
     if (g_interpolate) {
@@ -2324,6 +2368,8 @@ void Init(HMODULE self) {
                 Log("skeletons blended before the held props are placed");
             if (HookCall(SITE_BikeHands, reinterpret_cast<void*>(&HookedBikeHands), reinterpret_cast<void**>(&g_origBikeHands), EXPECT_BikeHands))
                 Log("cyclist's hands put on the handlebar on every frame");
+            if (HookCall(SITE_MenuSystem, reinterpret_cast<void*>(&HookedMenuSystem), reinterpret_cast<void**>(&g_origMenuSystem), EXPECT_MenuSystem))
+                Log("shop menus count a press once");
             if (HookCall(SITE_Mirrors, reinterpret_cast<void*>(&HookedMirrors), reinterpret_cast<void**>(&g_origMirrors), EXPECT_Mirrors))
                 Log("mirror camera blended");
             g_smoothFog = GetPrivateProfileIntW(L"Renewed120", L"SmoothFog", 1, ini) != 0;

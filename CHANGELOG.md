@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.82
+
+Two fixes for menus found after v0.81.
+
+### Fixed
+- **Shop menus racing down the list** (clothes, Ammu-Nation and the other shops): one press moved the highlight
+  several lines, as if the button was held, and the menu sound played two to six times. These menus read the buttons
+  on every drawn frame, but the mod only refreshes the controller, keyboard and mouse on simulation steps, so one
+  press counted on every frame of its step. It now counts once.
+- **Map of the pause menu hardly zooming with the mouse wheel** at a high frame rate: the game only takes a wheel
+  notch on a frame where more than 20 ms passed since the last one, so above 30 fps most notches were lost (four in
+  five at 240 fps). This is the original game's, shown by the unlocked frame rate. Notches are now kept until the map
+  takes them.
+
 ## v0.81
 
 Two fixes found after v0.8.
