@@ -32,6 +32,20 @@ void ApplyCamera(bool tickFrame, float alpha);
 void CapturePedFrames(bool tickFrame);
 // After PreRender, before the ped shadows and the scene are drawn: blend skeletons and vehicle/cutscene parts.
 void ApplyHierarchies(bool tickFrame, float alpha);
+void BeginAnimationPoseFrame();
+void BeginPedPreRenderPoses();
+void EndPedPreRenderPoses();
+void CapturePresentedPedPoses();
+void ProbePlayerPose(unsigned phase);
+void TrackAnimationPoses();
+void OnNativeAnimationPose(void* hierarchy);
+struct PoseDiagnostics {
+    unsigned tickNative, tickChanged, tickMissing;
+    unsigned frameNative, frameChanged, frameMissing, frameReused;
+    unsigned cameraSaved, cameraSkipped;
+    unsigned phaseRead[4], phaseChanged[4];
+};
+PoseDiagnostics TakePoseDiagnostics();
 // Around CRenderer::PreRender on render-only frames: keep the vehicles' and peds' physics state untouched.
 void SaveVehicles();
 void SavePeds();

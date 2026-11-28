@@ -1,3 +1,4 @@
+void InstallWheelHudReplay();
 // Renewed120 - high frame rate for GTA San Andreas 1.0 US.
 //
 // - Direct3D9 (works with a DXVK d3d9.dll too): the monitor's refresh rate instead of the fixed 60 Hz, borderless
@@ -583,7 +584,16 @@ void FlushGuard();
 void RestoreSun();
 void RestoreFov();
 void RestoreTheCamera();
+using MatrixUpdateFn = void* (__cdecl*)(void*);
+MatrixUpdateFn g_origNativeMatrixUpdate = nullptr;
+void* __cdecl HookedNativeMatrixUpdate(void* hierarchy) {
+    void* result = g_origNativeMatrixUpdate(hierarchy);
+    if (Interp::PedSkeleton()) Interp::OnNativeAnimationPose(hierarchy);
+    return result;
+}
+
 void __cdecl HookedTimerUpdate() {
+    if (g_origNativeMatrixUpdate && Interp::PedSkeleton()) Interp::BeginAnimationPoseFrame();
     static LARGE_INTEGER freq, nextTick;
     g_frameQpc = FrameQpcNow();   // the time this frame is blended for, everywhere
     if (g_logicHz <= 0) { g_origTimerUpdate(); return; }   // split disabled after a partial hook failure
@@ -599,6 +609,18 @@ void __cdecl HookedTimerUpdate() {
     // frames then one of 0.5, for as long as the frame and tick schedules stayed that close.)
     if (!tick) tick = now.QuadPart >= nextTick.QuadPart;
     if (tick) {
+        if (g_origNativeMatrixUpdate && g_ticks && g_ticks % 150 == 0) {
+            const auto d = Interp::TakePoseDiagnostics();
+            if (d.tickNative || d.tickChanged || d.tickMissing || d.frameNative ||
+                d.frameChanged || d.frameMissing || d.frameReused)
+                Log("CJ pose: tick native=%u changed=%u missing=%u; render native=%u changed=%u missing=%u reused=%u; camera saved=%u skipped=%u",
+                    d.tickNative, d.tickChanged, d.tickMissing, d.frameNative, d.frameChanged,
+                    d.frameMissing, d.frameReused, d.cameraSaved, d.cameraSkipped);
+            if (d.phaseRead[0] || d.phaseRead[1] || d.phaseRead[2] || d.phaseRead[3])
+                Log("CJ pose phases: between frames=%u/%u before PreRender=%u/%u during PreRender=%u/%u after PreRender=%u/%u",
+                    d.phaseChanged[0], d.phaseRead[0], d.phaseChanged[1], d.phaseRead[1],
+                    d.phaseChanged[2], d.phaseRead[2], d.phaseChanged[3], d.phaseRead[3]);
+        }
         // Keep a fixed schedule; resync after hitches instead of fast-forwarding.
         const LONGLONG sched = (nextTick.QuadPart == 0 || menu || now.QuadPart > nextTick.QuadPart + 2 * period)
                                    ? now.QuadPart : nextTick.QuadPart;
@@ -640,6 +662,7 @@ void __cdecl HookedTimerUpdate() {
         ++Interp::g_timing.ticks;
     } else {
         g_renderOnly = true;
+        Interp::ProbePlayerPose(0);
     }
 }
 
@@ -1037,7 +1060,11 @@ void FlushGuard() {
 void PreRenderBody();
 void __cdecl HookedPreRender() {
     Telemetry::Stamp(Telemetry::M_PreStart);
+    if (g_renderOnly) Interp::ProbePlayerPose(1);
+    Interp::BeginPedPreRenderPoses();
     PreRenderBody();
+    Interp::EndPedPreRenderPoses();
+    if (g_renderOnly) Interp::ProbePlayerPose(2);
     Telemetry::Stamp(Telemetry::M_PreEnd);
 }
 // Police helicopter searchlights: CHeli::PreRender (vtable 0x8716C4) adds its light to a list (count 0xC1C96C) that
@@ -2114,6 +2141,7 @@ void __fastcall HookedRtShadows(void* self, void* edx) {
 constexpr uintptr_t SITE_PedsAfterPreRender = 0x53EA03, EXPECT_PedsAfterPreRender = 0x563430;
 VoidFn g_origPedsAfterPreRender = nullptr;
 void __cdecl HookedPedsAfterPreRender() {
+    if (g_renderOnly && !g_hierDone) Interp::ProbePlayerPose(3);
     if (g_interpolate && !g_hierDone) { Interp::ApplyHierarchies(!g_renderOnly, TickAlpha()); g_hierDone = true; }
     g_origPedsAfterPreRender();
 }
@@ -2239,9 +2267,11 @@ const int* __cdecl HookedVideoModes() {
 }
 
 HRESULT WINAPI HookedPresent(void* dev, const RECT* src, const RECT* dst, HWND wnd, const void* dirty) {
+    if (g_logicHz > 0 && g_interpolate) Interp::CapturePresentedPedPoses();
     Telemetry::Stamp(Telemetry::M_PresentHook);
     if (g_noFrameLimiter) *reinterpret_cast<volatile uint8_t*>(ADDR_FrameLimiter) = 0;   // the menu or gta_sa.set may turn it on
     FlushGuard();
+    Interp::ProbePlayerPose(4);
     UpdatePrevCam();   // this frame's camera, for the next frame's spark streaks
     ++g_presentCount;
     Telemetry::OnFrame();
@@ -2347,7 +2377,19 @@ void Init(HMODULE self) {
                      reinterpret_cast<void**>(&g_origTimerUpdate), EXPECT_TimerUpdate) &&
             HookCall(SITE_GameProcess, reinterpret_cast<void*>(&HookedGameProcess),
                      reinterpret_cast<void**>(&g_origGameProcess), EXPECT_GameProcess))
+        {
             Log("logic/render split active: LogicHz=%d", g_logicHz);
+            InstallWheelHudReplay();
+            // Hook the inner RenderWare call, leaving the outer game function
+            // available to animation and physics plugins that wrap it.
+            if (HookCall(0x532B5B, reinterpret_cast<void*>(&HookedNativeMatrixUpdate),
+                         reinterpret_cast<void**>(&g_origNativeMatrixUpdate), 0x7C51D0)) {
+                Interp::TrackAnimationPoses();
+                Log("ped skeletons: native animation pose tracking active");
+            } else {
+                Log("ped skeletons: native animation pose tracking unavailable");
+            }
+        }
         else { Log("logic/render split FAILED, running without it"); g_logicHz = 0; }
     }
     if (g_logicHz > 0) {

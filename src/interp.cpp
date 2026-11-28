@@ -380,14 +380,59 @@ void RestorePool(Slot* slots, int maxSlots) {
 // The bones of skinned models are not RwFrames: their pose lives in the hierarchy's pMatrixArray (numNodes x
 // RwMatrix, world space), recomputed from the animation every time the game updates the hierarchy.
 constexpr int MaxHier = 64;
+constexpr uintptr_t ADDR_LocalPlayerPed = 0xB7CD98;
 struct HierSet {
     bool valid = false, moved = false, applied = false;
     void* hier = nullptr;
     uint8_t* mats = nullptr;
     int n = 0;
-    Pose prev[MaxHier], curr[MaxHier];
+    uint32_t sourcePose = 0, presentedPose = 0;
+    bool presented = false, acceptedThisFrame = false, continuousBeforePreRender = false;
+    Pose prev[MaxHier], curr[MaxHier], drawn[MaxHier];
+    Pose visible[MaxHier];
 };
 HierSet g_pedHier[MaxPed];
+
+struct NativePose {
+    const void* hierarchy;
+    const uint8_t* matrices;
+    uint32_t fingerprint;
+    bool preRender;
+};
+NativePose g_nativePoses[2048]{};
+bool g_trackNativePoses = false;
+bool g_recordingPreRender = false;
+PoseDiagnostics g_poseDiagnostics{};
+uint32_t g_playerProbePose = 0;
+const uint8_t* g_playerProbeMatrices = nullptr;
+
+NativePose& NativePoseEntry(const void* hierarchy) {
+    return g_nativePoses[(reinterpret_cast<uintptr_t>(hierarchy) >> 4) % 2048];
+}
+
+uint32_t FingerprintPose(const uint8_t* matrices, int count) {
+    uint32_t hash = 2166136261u;
+    for (int i = 0; i < count; ++i) {
+        for (int row = 0; row < 4; ++row) {
+            for (int axis = 0; axis < 3; ++axis) {
+                uint32_t value;
+                std::memcpy(&value, matrices + i * 0x40 + row * 0x10 + axis * 4, sizeof(value));
+                hash = (hash ^ value) * 16777619u;
+            }
+        }
+    }
+    return hash;
+}
+
+enum class NativePoseState { Missing, Changed, Match };
+
+NativePoseState CheckNativePose(const void* hierarchy, const uint8_t* matrices, int count) {
+    const auto& pose = NativePoseEntry(hierarchy);
+    if (pose.hierarchy != hierarchy || pose.matrices != matrices) return NativePoseState::Missing;
+    __try {
+        return pose.fingerprint == FingerprintPose(matrices, count) ? NativePoseState::Match : NativePoseState::Changed;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return NativePoseState::Missing; }
+}
 
 bool GetHier(uintptr_t ent, void*& hier, uint8_t*& mats, int& n) {
     __try {
@@ -405,6 +450,41 @@ bool GetHier(uintptr_t ent, void*& hier, uint8_t*& mats, int& n) {
 
 bool ReadHier(uint8_t* mats, int n, Pose* out) {
     __try { for (int i = 0; i < n; ++i) ReadPose(mats + 0x40 * i, out[i]); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool IsLastDrawnPose(const HierSet& h, void* hierarchy, uint8_t* mats, int count) {
+    if (!h.applied || h.hier != hierarchy || h.mats != mats || h.n != count) return false;
+    Pose live[MaxHier];
+    return ReadHier(mats, count, live) && std::memcmp(live, h.drawn, count * sizeof(Pose)) == 0;
+}
+
+void PoseToLocal(const Pose& M, const Pose& w, Pose& l);
+
+bool IsContinuousPose(const HierSet& h, void* hierarchy, uint8_t* mats, int count) {
+    if (!h.valid || h.hier != hierarchy || h.mats != mats || h.n != count) return false;
+    __try {
+        const auto live = FingerprintPose(mats, count);
+        if (live == h.sourcePose || (h.presented && live == h.presentedPose) ||
+            IsLastDrawnPose(h, hierarchy, mats, count)) return true;
+        if (!h.presented) return false;
+        // A render-time root transform moves the whole skeleton without
+        // changing the articulated pose. Compare bones in the root basis.
+        Pose root;
+        ReadPose(mats, root);
+        for (int i = 0; i < count; ++i) {
+            Pose bone, current, previous;
+            ReadPose(mats + i * 0x40, bone);
+            PoseToLocal(root, bone, current);
+            PoseToLocal(h.visible[0], h.visible[i], previous);
+            for (int axis = 0; axis < 3; ++axis) {
+                if (!(std::abs(current.r[axis] - previous.r[axis]) < 0.0002f &&
+                      std::abs(current.u[axis] - previous.u[axis]) < 0.0002f &&
+                      std::abs(current.a[axis] - previous.a[axis]) < 0.0002f &&
+                      std::abs(current.p[axis] - previous.p[axis]) < 0.0002f)) return false;
+            }
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
 bool WriteHier(uint8_t* mats, int n, const Pose* in) {
@@ -455,13 +535,42 @@ void ResetPedFrame(int i) {
 // One skeleton: captured (relative to its anchor) on tick frames, blended on every frame. pedIdx < 0 = an object
 // (cutscene characters are skinned objects, not peds), anchored to its frame.
 void HierStep(Slot& s, HierSet& h, int pedIdx, bool tickFrame, float alpha) {
+    h.acceptedThisFrame = false;
     auto anchor = [&](Pose& M) { return pedIdx >= 0 ? PedAnchor(pedIdx, s.ent, M) : EntityMatrix(s.ent, M); };
     void* hier = nullptr; uint8_t* mats = nullptr; int n = 0;
     if (!GetHier(s.ent, hier, mats, n)) { h.valid = false; h.applied = false; return; }
+    if (pedIdx >= 0 && g_trackNativePoses) {
+        const auto state = CheckNativePose(hier, mats, n);
+        const bool reuse = state == NativePoseState::Missing && !tickFrame &&
+                           ((h.continuousBeforePreRender && h.valid && h.hier == hier &&
+                             h.mats == mats && h.n == n) ||
+                            IsContinuousPose(h, hier, mats, n));
+        if (s.ent == *reinterpret_cast<const uintptr_t*>(ADDR_LocalPlayerPed)) {
+            auto& d = g_poseDiagnostics;
+            if (tickFrame) {
+                if (state == NativePoseState::Match) ++d.tickNative;
+                else if (state == NativePoseState::Changed) ++d.tickChanged;
+                else ++d.tickMissing;
+            } else {
+                if (state == NativePoseState::Match) ++d.frameNative;
+                else if (reuse) ++d.frameReused;
+                else if (state == NativePoseState::Changed) ++d.frameChanged;
+                else ++d.frameMissing;
+            }
+        }
+        if (state != NativePoseState::Match && !reuse) {
+            if (tickFrame || state == NativePoseState::Changed) h.valid = false;
+            h.applied = false;
+            return;
+        }
+    }
     const bool sameSet = h.valid && h.hier == hier && h.mats == mats && h.n == n;
     if (tickFrame || !sameSet) {
         Pose now[MaxHier], M;
         if (!ReadHier(mats, n, now) || !anchor(M)) { h.valid = false; return; }
+        h.presented = false;
+        if (pedIdx >= 0 && g_trackNativePoses)
+            h.sourcePose = NativePoseEntry(hier).fingerprint;
         for (int k = 0; k < n; ++k) { Pose l; PoseToLocal(M, now[k], l); now[k] = l; }
         h.moved = false;
         for (int k = 0; k < n; ++k) {
@@ -471,6 +580,7 @@ void HierStep(Slot& s, HierSet& h, int pedIdx, bool tickFrame, float alpha) {
         }
         h.valid = true; h.hier = hier; h.mats = mats; h.n = n;
     }
+    h.acceptedThisFrame = true;
     // a still skeleton is left alone on tick frames; on render-only frames PreRender may have moved a ped with its frame
     if (!h.moved && (tickFrame || pedIdx < 0 || !g_pedPreOk[pedIdx])) return;
     Pose out[MaxHier], M;
@@ -485,16 +595,28 @@ void HierStep(Slot& s, HierSet& h, int pedIdx, bool tickFrame, float alpha) {
         else PoseToWorld(M, b, out[k]);
     }
     if (!all) for (int k = 0; k < n; ++k) PoseToWorld(M, h.curr[k], out[k]);
-    if (WriteHier(mats, n, out)) h.applied = true;
+    if (WriteHier(mats, n, out)) {
+        std::memcpy(h.drawn, out, n * sizeof(Pose));
+        h.applied = true;
+    }
 }
 
-void RestoreHier(HierSet& h, const Slot& s) {
+void RestoreHier(HierSet& h, const Slot& s, bool trackContinuity = false) {
     if (!h.applied) return;
     Pose M, out[MaxHier];
     // the skeleton may have been rebuilt or freed since it was blended (clothes change, loading a save): only write
     // into the very same one
     void* hier = nullptr; uint8_t* mats = nullptr; int n = 0;
     const bool same = s.valid && GetHier(s.ent, hier, mats, n) && hier == h.hier && mats == h.mats && n == h.n;
+    if (same) {
+        // Animation, IK or a physics plugin may have replaced the render pose
+        // in the same hierarchy. Keep that newer pose and drop the old blend.
+        if (!ReadHier(mats, n, out) || std::memcmp(out, h.drawn, n * sizeof(Pose)) != 0) {
+            if (!trackContinuity || !IsContinuousPose(h, hier, mats, n)) h.valid = false;
+            h.applied = false;
+            return;
+        }
+    }
     if (same && EntityMatrix(s.ent, M)) {
         for (int k = 0; k < h.n; ++k) PoseToWorld(M, h.curr[k], out[k]);
         WriteHier(h.mats, h.n, out);
@@ -770,17 +892,33 @@ void* g_shownHier = nullptr; uint8_t* g_shownMats = nullptr; int g_shownN = 0;
 uint32_t g_shownFlags = 0; bool g_shownSwapped = false;
 void KeepShownPlayerSkeleton() {
     g_shownHier = nullptr; g_shownSwapped = false;
-    const uintptr_t ped = *reinterpret_cast<const uintptr_t*>(0xB7CD98);   // CWorld::Players[0].m_pPed
+    const uintptr_t ped = *reinterpret_cast<const uintptr_t*>(ADDR_LocalPlayerPed);
     void* h = nullptr; uint8_t* m = nullptr; int n = 0;
     if (!ped || !GetHier(ped, h, m, n)) return;
+    if (g_trackNativePoses) {
+        bool owned = false;
+        for (int i = 0; i < MaxPed; ++i) {
+            if (g_ped[i].valid && g_ped[i].ent == ped) {
+                owned = IsContinuousPose(g_pedHier[i], h, m, n);
+                break;
+            }
+        }
+        if (!owned) return;
+        ++g_poseDiagnostics.cameraSaved;
+    }
     __try { std::memcpy(g_shownSkel, m, n * 0x40); g_shownHier = h; g_shownMats = m; g_shownN = n; }
     __except (EXCEPTION_EXECUTE_HANDLER) { g_shownHier = nullptr; }
 }
 bool SwapShownPlayerSkeleton() {
     if (!g_shownHier) return false;
-    const uintptr_t ped = *reinterpret_cast<const uintptr_t*>(0xB7CD98);
+    const uintptr_t ped = *reinterpret_cast<const uintptr_t*>(ADDR_LocalPlayerPed);
     void* h = nullptr; uint8_t* m = nullptr; int n = 0;
     if (!ped || !GetHier(ped, h, m, n) || h != g_shownHier || m != g_shownMats || n != g_shownN) { g_shownHier = nullptr; return false; }
+    if (g_trackNativePoses && !g_shownSwapped && CheckNativePose(h, m, n) != NativePoseState::Match) {
+        ++g_poseDiagnostics.cameraSkipped;
+        g_shownHier = nullptr;
+        return false;
+    }
     // CPed::GetBonePosition, as the camera calls it, poses the skeleton again from the animation (UpdateRpHAnim,
     // 0x532B20) when the ped's "posed this frame" flag (0x400 of +0x474) is clear, as it is right after a tick: that
     // overwrote the skeleton put here. The flag is raised while it is swapped in, and put back with it.
@@ -798,6 +936,83 @@ bool SwapShownPlayerSkeleton() {
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { g_shownHier = nullptr; return false; }
 }
+void BeginAnimationPoseFrame() {
+    std::memset(g_nativePoses, 0, sizeof(g_nativePoses));
+    for (auto& h : g_pedHier) h.continuousBeforePreRender = false;
+}
+void BeginPedPreRenderPoses() { g_recordingPreRender = true; }
+void EndPedPreRenderPoses() {
+    g_recordingPreRender = false;
+    if (!g_trackNativePoses || !g_pedSkeleton) return;
+    // Native ped PreRender can finish IK and bone adjustments after HAnim.
+    // Only refresh hierarchies that actually ran HAnim in this pass.
+    for (const auto& ped : g_ped) {
+        if (!ped.valid) continue;
+        void* hierarchy;
+        uint8_t* matrices;
+        int count;
+        if (!GetHier(ped.ent, hierarchy, matrices, count)) continue;
+        auto& pose = NativePoseEntry(hierarchy);
+        if (!pose.preRender || pose.hierarchy != hierarchy || pose.matrices != matrices) continue;
+        __try { pose.fingerprint = FingerprintPose(matrices, count); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { pose = {}; }
+    }
+}
+void TrackAnimationPoses() { g_trackNativePoses = true; }
+void CapturePresentedPedPoses() {
+    if (!g_trackNativePoses || !g_pedSkeleton) return;
+    for (int i = 0; i < MaxPed; ++i) {
+        auto& h = g_pedHier[i];
+        if (!g_ped[i].valid || !h.valid || !h.acceptedThisFrame) continue;
+        void* hierarchy;
+        uint8_t* matrices;
+        int count;
+        h.presented = false;
+        if (!GetHier(g_ped[i].ent, hierarchy, matrices, count) ||
+            h.hier != hierarchy || h.mats != matrices || h.n != count) continue;
+        __try {
+            h.presentedPose = FingerprintPose(matrices, count);
+            h.presented = ReadHier(matrices, count, h.visible);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+}
+PoseDiagnostics TakePoseDiagnostics() {
+    const auto result = g_poseDiagnostics;
+    g_poseDiagnostics = {};
+    return result;
+}
+void OnNativeAnimationPose(void* hierarchy) {
+    if (!hierarchy) return;
+    __try {
+        auto* bytes = static_cast<const uint8_t*>(hierarchy);
+        const int count = *reinterpret_cast<const int*>(bytes + 4);
+        auto* matrices = *reinterpret_cast<const uint8_t* const*>(bytes + 8);
+        if (matrices && count > 0 && count <= MaxHier)
+            NativePoseEntry(hierarchy) = {hierarchy, matrices, FingerprintPose(matrices, count), g_recordingPreRender};
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+void ProbePlayerPose(unsigned phase) {
+    if (!g_trackNativePoses || !g_pedSkeleton) return;
+    const auto player = *reinterpret_cast<const uintptr_t*>(ADDR_LocalPlayerPed);
+    void* hierarchy;
+    uint8_t* matrices;
+    int count;
+    if (!player || !GetHier(player, hierarchy, matrices, count)) {
+        g_playerProbeMatrices = nullptr;
+        return;
+    }
+    __try {
+        const auto hash = FingerprintPose(matrices, count);
+        if (phase < 4 && g_playerProbeMatrices == matrices) {
+            ++g_poseDiagnostics.phaseRead[phase];
+            if (hash != g_playerProbePose) ++g_poseDiagnostics.phaseChanged[phase];
+        }
+        g_playerProbeMatrices = matrices;
+        g_playerProbePose = hash;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_playerProbeMatrices = nullptr; }
+}
+
 void SetVehicleParts(bool on) { g_vehParts = on; }
 bool VehicleParts() { return g_vehParts; }
 void SetPedSkeleton(bool on) { g_pedSkeleton = on; }
@@ -862,6 +1077,15 @@ void ApplyHierarchies(bool tickFrame, float alpha) {
 void CapturePedFrames(bool tickFrame) {
     DropDead();
     for (int i = 0; i < MaxPed; ++i) {
+        auto& h = g_pedHier[i];
+        h.continuousBeforePreRender = false;
+        if (!tickFrame && g_trackNativePoses && g_pedSkeleton && g_ped[i].valid && h.valid) {
+            void* hierarchy;
+            uint8_t* matrices;
+            int count;
+            if (GetHier(g_ped[i].ent, hierarchy, matrices, count))
+                h.continuousBeforePreRender = IsContinuousPose(h, hierarchy, matrices, count);
+        }
         g_pedPreOk[i] = g_ped[i].valid && ReadEntityPose(g_ped[i].ent, g_pedPre[i]);
         if (!g_pedPreOk[i] || tickFrame) continue;
         Pose f{};
@@ -918,7 +1142,7 @@ void Reset() {
 void Restore() {
     DropDead();
     RestorePool(g_ped, MaxPed);
-    for (int i = 0; i < MaxPed; ++i) RestoreHier(g_pedHier[i], g_ped[i]);
+    for (int i = 0; i < MaxPed; ++i) RestoreHier(g_pedHier[i], g_ped[i], g_trackNativePoses);
     for (auto& b : g_vehBones) RestoreBones(b);
     RestorePool(g_veh, MaxVeh);
     RestoreCutscene();
